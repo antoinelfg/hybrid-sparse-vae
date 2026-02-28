@@ -1,14 +1,13 @@
 """Hybrid Sparse VAE — full generative model.
 
 Combines:
-  * A 1-D convolutional encoder/decoder backbone,
+  * Encoder/decoder backbones (linear or ResNet),
   * A structured latent space with polar factorization (γ × δ), and
   * Exact KL-divergence losses (Gamma + Categorical).
 
-Two decoder modes:
-  * ``"resnet"`` — deep ResNet1D (for real data)
-  * ``"linear"`` — deliberately simple (for toy problems, forces the
-    latent code to carry all structure)
+Encoder/Decoder modes:
+  * ``"linear"`` — symmetric MLP (recommended for toy experiments)
+  * ``"resnet"`` — deep Conv1D (for real data)
 """
 
 from __future__ import annotations
@@ -22,15 +21,39 @@ from modules.latent_space import StructuredLatentSpace
 
 
 # ---------------------------------------------------------------------------
-#  "Lobotomized" linear decoder for toy experiments
+#  Simple linear encoder/decoder for toy experiments
 # ---------------------------------------------------------------------------
 
-class LinearDecoder1D(nn.Module):
-    """Deliberately simple decoder: z → Linear → ReLU → Linear → output.
+class LinearEncoder1D(nn.Module):
+    """Simple MLP encoder: input → flatten → Linear → ReLU → Linear → h.
 
-    Forces the model to encode all structure in z = A · B, because the
-    decoder has no capacity to "invent" structure on its own.
+    Symmetric counterpart of :class:`LinearDecoder1D`. For toy problems,
+    a symmetric encoder/decoder pair ensures clean gradient flow.
     """
+
+    def __init__(
+        self,
+        input_channels: int = 1,
+        input_length: int = 128,
+        hidden_dim: int = 256,
+        output_dim: int = 256,
+    ):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_channels * input_length, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        """x: [B, C, T] → h: [B, output_dim]"""
+        return self.net(x.view(x.size(0), -1))
+
+
+class LinearDecoder1D(nn.Module):
+    """Deliberately simple decoder: z → Linear → ReLU → Linear → output."""
 
     def __init__(
         self,
@@ -45,6 +68,8 @@ class LinearDecoder1D(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, output_channels * output_length),
         )
 
@@ -58,26 +83,16 @@ class HybridSparseVAE(nn.Module):
 
     Parameters
     ----------
-    input_channels : int
-        Number of channels in the input signal.
-    input_length : int
-        Temporal length of the input signal.
-    encoder_hidden : list[int] | None
-        Channel widths for the encoder ResBlocks.
+    input_channels, input_length : int
+        Signal shape.
+    encoder_type, decoder_type : str
+        ``"linear"`` (toy) or ``"resnet"`` (real data).
     encoder_output_dim : int
-        Flat feature dim produced by the encoder.
-    n_atoms : int
-        Number of dictionary atoms.
-    latent_dim : int
-        Physical latent dimension.
-    decoder_type : str
-        ``"resnet"`` for a deep conv decoder, ``"linear"`` for a
-        deliberately simple one (recommended for toy experiments).
-    decoder_hidden : list[int] | None
-        Channel widths for the decoder ResBlocks (only used when
-        ``decoder_type="resnet"``).
+        Feature dimension between encoder and latent space.
+    n_atoms, latent_dim : int
+        Dictionary width and physical latent dimension.
     dict_init : str
-        Dictionary initialization (``"dct"``, ``"random"``, ``"identity"``).
+        ``"dct"``, ``"random"``, or ``"identity"``.
     normalize_dict : bool
         L2-normalize dictionary columns.
     k_min : float
@@ -88,11 +103,12 @@ class HybridSparseVAE(nn.Module):
         self,
         input_channels: int = 1,
         input_length: int = 128,
-        encoder_hidden: list[int] | None = None,
+        encoder_type: str = "linear",
         encoder_output_dim: int = 256,
         n_atoms: int = 64,
         latent_dim: int = 128,
         decoder_type: str = "linear",
+        encoder_hidden: list[int] | None = None,
         decoder_hidden: list[int] | None = None,
         dict_init: str = "dct",
         normalize_dict: bool = True,
@@ -101,11 +117,19 @@ class HybridSparseVAE(nn.Module):
         super().__init__()
 
         # ---- Encoder ---------------------------------------------------
-        self.encoder = Encoder1D(
-            input_channels=input_channels,
-            hidden_channels=encoder_hidden,
-            output_dim=encoder_output_dim,
-        )
+        if encoder_type == "linear":
+            self.encoder = LinearEncoder1D(
+                input_channels=input_channels,
+                input_length=input_length,
+                hidden_dim=256,
+                output_dim=encoder_output_dim,
+            )
+        else:
+            self.encoder = Encoder1D(
+                input_channels=input_channels,
+                hidden_channels=encoder_hidden,
+                output_dim=encoder_output_dim,
+            )
 
         # ---- Structured Latent Space -----------------------------------
         self.latent = StructuredLatentSpace(

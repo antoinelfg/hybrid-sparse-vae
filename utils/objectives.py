@@ -45,8 +45,12 @@ def kl_gamma(
 
     t1 = (k - k_0) * torch.digamma(k)
     t2 = -torch.lgamma(k) + torch.lgamma(k_0)
-    t3 = k_0 * (torch.log(theta) - torch.log(theta_0))
-    t4 = k * (theta_0 / theta - 1.0)
+
+    # SCALE parameterization: θ = scale (mean = k·θ)
+    # t3: k₀ · (ln θ₀ - ln θ)
+    t3 = k_0 * (torch.log(theta_0) - torch.log(theta))
+    # t4: k · (θ/θ₀ - 1)
+    t4 = k * (theta / theta_0 - 1.0)
 
     kl = t1 + t2 + t3 + t4  # element-wise
     return kl.sum()

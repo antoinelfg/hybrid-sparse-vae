@@ -42,32 +42,36 @@ class TrainConfig:
 
     # Architecture
     n_atoms: int = 64
-    latent_dim: int = 128
+    latent_dim: int = 64
     encoder_output_dim: int = 256
+    encoder_type: str = "linear"       # "linear" (toy) or "resnet" (real data)
     decoder_type: str = "linear"       # "linear" (toy) or "resnet" (real data)
     dict_init: str = "dct"
     normalize_dict: bool = True
     k_min: float = 0.1
 
     # Training
-    lr: float = 1e-3
+    lr: float = 3e-4
     epochs: int = 200
     temp_init: float = 1.0
     temp_min: float = 0.1
     temp_anneal_epochs: int = 50
 
-    # KL schedule — "β warm-up" then hold
-    #   epoch [1 .. beta_warmup_start]    →  β = 0  (pure reconstruction)
-    #   epoch (beta_warmup_start .. beta_warmup_end] → β linearly ↑ to beta_final
+    # KL schedule — soft β warm-up (never fully zero)
+    #   epoch 1                           →  β = beta_min (tiny, not zero)
+    #   epoch [1 .. beta_warmup_end]      →  β linearly ↑ to beta_final
     #   epoch > beta_warmup_end           →  β = beta_final
-    beta_warmup_start: int = 10        # free reconstruction phase
-    beta_warmup_end: int = 50          # end of linear ramp
-    beta_gamma_final: float = 0.1      # final β for KL_Gamma
-    beta_delta_final: float = 0.1      # final β for KL_Cat
+    beta_min: float = 0           # start with tiny KL (prevents k explosion)
+    beta_warmup_end: int = 100          # longer ramp for stability
+    beta_gamma_final: float = 1      # final β for KL_Gamma
+    beta_delta_final: float = 1      # final β for KL_Cat
 
     # Prior — "trou noir" sparse-inducing
-    k_0: float = 0.2                   # pulls k toward super-Gaussian regime
+    k_0: float = 0.5                  # pulls k toward super-Gaussian regime
     theta_0: float = 1.0
+
+    # Delta prior: [P(-1), P(0), P(+1)] — relaxed to allow more active atoms
+    delta_prior: str = "0.15,0.70,0.15"  # serialized as string for Hydra
 
     # Misc
     seed: int = 42
@@ -77,7 +81,7 @@ class TrainConfig:
 
 
 # ---------------------------------------------------------------------------
-#  Toy data generator — INTERMITTENT sinusoids
+#  Toy data generator — continuous sinusoids (simple first)
 # ---------------------------------------------------------------------------
 
 def make_toy_data(
@@ -86,12 +90,10 @@ def make_toy_data(
     n_components: int = 3,
     seed: int = 0,
 ) -> TensorDataset:
-    """Sum of *n_components* sinusoids that switch on/off randomly.
+    """Sum of *n_components* continuous sinusoids.
 
-    Each component is active in a random contiguous window of the
-    signal (between 30 % and 80 % of the total length).  This forces
-    the model to use δ (ternary switch) to handle onset/offset, because
-    a continuous decoder cannot predict discontinuities.
+    Simple baseline: get this working first (k should drop below 1),
+    then graduate to intermittent/gated signals.
     """
     rng = torch.Generator().manual_seed(seed)
     t = torch.linspace(0, 2 * torch.pi, length)
@@ -99,23 +101,9 @@ def make_toy_data(
     signals = []
     for _ in range(n_samples):
         freqs = torch.randint(1, 20, (n_components,), generator=rng).float()
-        amps = torch.rand(n_components, generator=rng) + 0.3   # avoid tiny amps
+        amps = torch.rand(n_components, generator=rng) + 0.3
         phases = torch.rand(n_components, generator=rng) * 2 * torch.pi
-
-        sig = torch.zeros(length)
-        for i in range(n_components):
-            wave = amps[i] * torch.sin(freqs[i] * t + phases[i])
-
-            # Random on/off window (30 %–80 % of length)
-            win_frac = 0.3 + 0.5 * torch.rand(1, generator=rng).item()
-            win_len = int(win_frac * length)
-            max_start = length - win_len
-            start = torch.randint(0, max(max_start, 1), (1,), generator=rng).item()
-
-            mask = torch.zeros(length)
-            mask[start : start + win_len] = 1.0
-            sig += wave * mask
-
+        sig = sum(a * torch.sin(f * t + p) for a, f, p in zip(amps, freqs, phases))
         signals.append(sig)
 
     X = torch.stack(signals).unsqueeze(1)  # [N, 1, T]
@@ -127,15 +115,12 @@ def make_toy_data(
 # ---------------------------------------------------------------------------
 
 def get_beta(epoch: int, cfg: TrainConfig) -> float:
-    """β warm-up schedule: 0 → β_final with linear ramp."""
-    if epoch <= cfg.beta_warmup_start:
-        return 0.0
+    """Soft β warm-up: beta_min → 1.0 (linear ramp, never fully zero)."""
     if epoch >= cfg.beta_warmup_end:
         return 1.0   # multiplied by beta_*_final in the loss call
-    frac = (epoch - cfg.beta_warmup_start) / max(
-        cfg.beta_warmup_end - cfg.beta_warmup_start, 1
-    )
-    return frac
+    # Linear from beta_min to 1.0 over [1, beta_warmup_end]
+    frac = (epoch - 1) / max(cfg.beta_warmup_end - 1, 1)
+    return cfg.beta_min + (1.0 - cfg.beta_min) * frac
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +144,7 @@ def train(cfg: TrainConfig) -> None:
     model = HybridSparseVAE(
         input_channels=cfg.input_channels,
         input_length=cfg.input_length,
+        encoder_type=cfg.encoder_type,
         encoder_output_dim=cfg.encoder_output_dim,
         n_atoms=cfg.n_atoms,
         latent_dim=cfg.latent_dim,
@@ -200,12 +186,17 @@ def train(cfg: TrainConfig) -> None:
 
             x_recon, info = model(batch_x, temp=temp)
 
+            # Parse delta prior
+            dp = [float(v) for v in cfg.delta_prior.split(",")]
+            delta_prior_t = torch.tensor(dp, device=device)
+
             loss, metrics = compute_hybrid_loss(
                 x=batch_x,
                 x_recon=x_recon,
                 params=info,
                 k_0=cfg.k_0,
                 theta_0=cfg.theta_0,
+                prior_probs=delta_prior_t,
                 beta_gamma=eff_beta_gamma,
                 beta_delta=eff_beta_delta,
             )
@@ -221,14 +212,20 @@ def train(cfg: TrainConfig) -> None:
         n_batches = len(loader)
         if epoch % cfg.log_every == 0 or epoch == 1:
             avg = {k: v / n_batches for k, v in epoch_metrics.items()}
-            k_mean = info["k"].mean().item()
-            k_min_val = info["k"].min().item()
-            sparsity = (info["delta"] == 0).float().mean().item()
+            k_all = info["k"]
+            delta = info["delta"]
+            active_mask = (delta != 0)  # atoms where δ ∈ {-1, +1}
+            k_mean = k_all.mean().item()
+            k_min_val = k_all.min().item()
+            k_active = k_all[active_mask].mean().item() if active_mask.any() else 0.0
+            n_active = active_mask.float().sum(-1).mean().item()  # avg active per sample
+            sparsity = (delta == 0).float().mean().item()
             log.info(
                 f"Epoch {epoch:4d} | loss {epoch_loss/n_batches:.4f} | "
                 f"recon {avg['recon']:.4f} | kl_γ {avg['kl_gamma']:.4f} | "
                 f"kl_δ {avg['kl_delta']:.4f} | "
-                f"k̄={k_mean:.3f}  k_min={k_min_val:.3f}  "
+                f"k̄={k_mean:.3f}  k_act={k_active:.3f}  "
+                f"n_act={n_active:.1f}/{cfg.n_atoms}  "
                 f"δ₀={sparsity:.2%}  "
                 f"β={eff_beta_gamma:.4f}  τ={temp:.3f}"
             )
