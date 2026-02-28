@@ -41,7 +41,7 @@ class TrainConfig:
     batch_size: int = 64
 
     # Architecture
-    n_atoms: int = 64
+    n_atoms: int = 128                  # overcomplete: 2x latent_dim
     latent_dim: int = 64
     encoder_output_dim: int = 256
     encoder_type: str = "linear"       # "linear" (toy) or "resnet" (real data)
@@ -52,19 +52,19 @@ class TrainConfig:
 
     # Training
     lr: float = 3e-4
-    epochs: int = 200
+    epochs: int = 400
     temp_init: float = 1.0
     temp_min: float = 0.1
     temp_anneal_epochs: int = 50
 
-    # KL schedule — soft β warm-up (never fully zero)
-    #   epoch 1                           →  β = beta_min (tiny, not zero)
-    #   epoch [1 .. beta_warmup_end]      →  β linearly ↑ to beta_final
-    #   epoch > beta_warmup_end           →  β = beta_final
-    beta_min: float = 0           # start with tiny KL (prevents k explosion)
-    beta_warmup_end: int = 100          # longer ramp for stability
-    beta_gamma_final: float = 1      # final β for KL_Gamma
-    beta_delta_final: float = 1      # final β for KL_Cat
+    # 3-Phase "Rocket Launch" schedule
+    #   Phase 1 [1..phase1_end]     : sampling="soft",  β=0  (sculpt latent topology)
+    #   Phase 2 (phase1..phase2_end]: sampling="stoch", β=0  (immunize to noise)
+    #   Phase 3 (phase2..epochs]    : sampling="stoch", β ramp 0→final (sparsify)
+    phase1_end: int = 100
+    phase2_end: int = 200
+    beta_gamma_final: float = 0.01
+    beta_delta_final: float = 0.01
 
     # Prior — "trou noir" sparse-inducing
     k_0: float = 0.5                  # pulls k toward super-Gaussian regime
@@ -107,6 +107,11 @@ def make_toy_data(
         signals.append(sig)
 
     X = torch.stack(signals).unsqueeze(1)  # [N, 1, T]
+
+    # --- Normalize to ~[-1, 1] so MSE is commensurate with KL ---
+    # Max theoretical amplitude ≈ 3 × 1.3 = 3.9.  Divide by 4.
+    X = X / 4.0
+
     return TensorDataset(X)
 
 
@@ -114,13 +119,16 @@ def make_toy_data(
 #  KL schedule
 # ---------------------------------------------------------------------------
 
-def get_beta(epoch: int, cfg: TrainConfig) -> float:
-    """Soft β warm-up: beta_min → 1.0 (linear ramp, never fully zero)."""
-    if epoch >= cfg.beta_warmup_end:
-        return 1.0   # multiplied by beta_*_final in the loss call
-    # Linear from beta_min to 1.0 over [1, beta_warmup_end]
-    frac = (epoch - 1) / max(cfg.beta_warmup_end - 1, 1)
-    return cfg.beta_min + (1.0 - cfg.beta_min) * frac
+def get_phase(epoch: int, cfg: TrainConfig) -> tuple[str, float]:
+    """Return (sampling_mode, beta_frac) for the current epoch."""
+    if epoch <= cfg.phase1_end:
+        return "soft", 0.0
+    if epoch <= cfg.phase2_end:
+        return "stochastic", 0.0
+    # Phase 3: stochastic + KL ramp
+    ramp_len = max(cfg.epochs - cfg.phase2_end, 1)
+    frac = (epoch - cfg.phase2_end) / ramp_len
+    return "stochastic", min(frac, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -169,11 +177,19 @@ def train(cfg: TrainConfig) -> None:
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         temp = get_temp(epoch)
-        beta_frac = get_beta(epoch, cfg)
+        sampling_mode, beta_frac = get_phase(epoch, cfg)
 
         # Effective betas for this epoch
         eff_beta_gamma = beta_frac * cfg.beta_gamma_final
         eff_beta_delta = beta_frac * cfg.beta_delta_final
+
+        # Phase label for logging
+        if epoch <= cfg.phase1_end:
+            phase_label = "P1:soft"
+        elif epoch <= cfg.phase2_end:
+            phase_label = "P2:stoch"
+        else:
+            phase_label = "P3:KL"
 
         epoch_loss = 0.0
         epoch_metrics: dict[str, float] = {
@@ -184,7 +200,7 @@ def train(cfg: TrainConfig) -> None:
             batch_x = batch_x.to(device)
             optimizer.zero_grad()
 
-            x_recon, info = model(batch_x, temp=temp)
+            x_recon, info = model(batch_x, temp=temp, sampling=sampling_mode)
 
             # Parse delta prior
             dp = [float(v) for v in cfg.delta_prior.split(",")]
@@ -214,14 +230,14 @@ def train(cfg: TrainConfig) -> None:
             avg = {k: v / n_batches for k, v in epoch_metrics.items()}
             k_all = info["k"]
             delta = info["delta"]
-            active_mask = (delta != 0)  # atoms where δ ∈ {-1, +1}
+            active_mask = (delta != 0)
             k_mean = k_all.mean().item()
-            k_min_val = k_all.min().item()
             k_active = k_all[active_mask].mean().item() if active_mask.any() else 0.0
-            n_active = active_mask.float().sum(-1).mean().item()  # avg active per sample
+            n_active = active_mask.float().sum(-1).mean().item()
             sparsity = (delta == 0).float().mean().item()
             log.info(
-                f"Epoch {epoch:4d} | loss {epoch_loss/n_batches:.4f} | "
+                f"Epoch {epoch:4d} [{phase_label}] | "
+                f"loss {epoch_loss/n_batches:.4f} | "
                 f"recon {avg['recon']:.4f} | kl_γ {avg['kl_gamma']:.4f} | "
                 f"kl_δ {avg['kl_delta']:.4f} | "
                 f"k̄={k_mean:.3f}  k_act={k_active:.3f}  "

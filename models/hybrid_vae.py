@@ -165,24 +165,12 @@ class HybridSparseVAE(nn.Module):
         self,
         x: Tensor,
         temp: float = 1.0,
+        sampling: str = "stochastic",
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        """
-        Parameters
-        ----------
-        x : Tensor — ``[B, C, T]``
-        temp : float
-            Gumbel-Softmax temperature.
-
-        Returns
-        -------
-        x_recon : Tensor — ``[B, C, T]``
-        info : dict
-            All diagnostic tensors from the latent space, plus
-            ``"x_recon"``.
-        """
-        h = self.encoder(x)              # [B, encoder_output_dim]
-        z, info = self.latent(h, temp=temp)  # [B, latent_dim]
-        x_recon = self.decoder(z)         # [B, C, T]
+        h = self.encoder(x)
+        z, info = self.latent(h, temp=temp, sampling=sampling)
+        x_recon = self.decoder(z)
 
         info["x_recon"] = x_recon
         return x_recon, info
+

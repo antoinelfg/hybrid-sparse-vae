@@ -73,22 +73,25 @@ class StructuredLatentSpace(nn.Module):
         self,
         h: Tensor,
         temp: float = 1.0,
+        sampling: str = "stochastic",
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """
         Parameters
         ----------
         h : Tensor — ``[B, input_dim]`` or ``[B, T, input_dim]``
-            Encoder features.
         temp : float
-            Gumbel-Softmax temperature (anneal toward 0 during training).
+            Temperature for Gumbel-Softmax / softmax.
+        sampling : str
+            ``"soft"`` — γ=k·θ, δ=continuous softmax (Phase 1: no noise)
+            ``"stochastic"`` — Gamma IRG + Gumbel-ST (Phase 2-3: normal VAE)
+            ``"deterministic"`` — mean + argmax (eval only)
 
         Returns
         -------
         z : Tensor — ``[..., latent_dim]``
             Reconstructed latent vector.
         info : dict
-            Diagnostic tensors: ``z``, ``B``, ``gamma``, ``delta``,
-            ``k``, ``theta``, ``logits``.
+            Diagnostic tensors.
         """
         params = self.fc_params(h)  # [..., n_atoms * 5]
 
@@ -103,19 +106,31 @@ class StructuredLatentSpace(nn.Module):
         k = F.softplus(raw_k) + self.k_min
         theta = F.softplus(raw_theta) + 1e-6
 
-        # ---------- A. Magnitude sampling (IRG Gamma) ------------------
-        gamma = sample_implicit_gamma(k, theta)  # [..., n_atoms]
+        # ---------- A. Magnitude --------------------------------------
+        if sampling == "soft":
+            # Gamma mean — fully differentiable, zero noise
+            gamma = k * theta
+        elif sampling == "deterministic":
+            gamma = k * theta
+        else:  # "stochastic"
+            gamma = sample_implicit_gamma(k, theta)
 
-        # ---------- B. Structure sampling (Ternary delta) ---------------
+        # ---------- B. Structure (Ternary delta) ----------------------
         leading_shape = logits_ternary.shape[:-1]
         logits_3 = logits_ternary.view(*leading_shape, self.n_atoms, 3)
 
-        # Gumbel-Softmax with Straight-Through estimator
-        delta_one_hot = F.gumbel_softmax(logits_3, tau=temp, hard=True)
+        if sampling == "soft":
+            # Continuous softmax relaxation — differentiable, no noise
+            probs = F.softmax(logits_3 / temp, dim=-1)
+            delta = probs[..., 2] - probs[..., 0]  # continuous in [-1, +1]
+        elif sampling == "deterministic":
+            idx = logits_3.argmax(dim=-1)
+            delta_one_hot = F.one_hot(idx, 3).float()
+            delta = delta_one_hot[..., 2] - delta_one_hot[..., 0]
+        else:  # "stochastic"
+            delta_one_hot = F.gumbel_softmax(logits_3, tau=temp, hard=True)
+            delta = delta_one_hot[..., 2] - delta_one_hot[..., 0]
 
-        # Map one-hot → scalar {-1, 0, +1}
-        #   class 0 → -1,  class 1 → 0,  class 2 → +1
-        delta = delta_one_hot[..., 2] - delta_one_hot[..., 0]
 
         # ---------- C. Polar factorization -----------------------------
         B = gamma * delta  # sparse signed activations  [..., n_atoms]
@@ -133,3 +148,4 @@ class StructuredLatentSpace(nn.Module):
             "logits": logits_3,
         }
         return z, info
+
