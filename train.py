@@ -11,6 +11,7 @@ Usage
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,24 +51,30 @@ class TrainConfig:
     normalize_dict: bool = True
     k_min: float = 0.1
 
+    # Dictionary learning
+    freeze_dict_until: int = 0          # freeze dict weights until this epoch (0=always learn)
+    dict_lr_mult: float = 0.1           # dict LR = lr * dict_lr_mult (slower adaptation)
+
     # Training
     lr: float = 3e-4
-    epochs: int = 400
+    epochs: int = 3000
     temp_init: float = 1.0
-    temp_min: float = 0.1
+    temp_min: float = 0.05
     temp_anneal_epochs: int = 50
 
-    # 3-Phase "Rocket Launch" schedule
-    #   Phase 1 [1..phase1_end]     : sampling="soft",  β=0  (sculpt latent topology)
-    #   Phase 2 (phase1..phase2_end]: sampling="stoch", β=0  (immunize to noise)
-    #   Phase 3 (phase2..epochs]    : sampling="stoch", β ramp 0→final (sparsify)
-    phase1_end: int = 100
-    phase2_end: int = 200
-    beta_gamma_final: float = 0.01
-    beta_delta_final: float = 0.01
+    # 4-Phase "Champion" schedule
+    #   P1 [1..phase1_end]              : soft, β=0    (sculpt topology)
+    #   P2 (phase1..phase2_end]         : stoch, β=0   (immunize to noise)
+    #   P3 (phase2..phase3_end]         : stoch, β ramp (sparsify)
+    #   P4 (phase3..epochs]             : stoch, β=max  (stationary convergence)
+    phase1_end: int = 400
+    phase2_end: int = 500
+    phase3_end: int = 1000
+    beta_gamma_final: float = 0.005     # flexible magnitude
+    beta_delta_final: float = 0.1       # strict structure
 
-    # Prior — "trou noir" sparse-inducing
-    k_0: float = 0.5                  # pulls k toward super-Gaussian regime
+    # Prior
+    k_0: float = 0.3                    # low prior → less KL tax
     theta_0: float = 1.0
 
     # Delta prior: [P(-1), P(0), P(+1)] — relaxed to allow more active atoms
@@ -120,15 +127,18 @@ def make_toy_data(
 # ---------------------------------------------------------------------------
 
 def get_phase(epoch: int, cfg: TrainConfig) -> tuple[str, float]:
-    """Return (sampling_mode, beta_frac) for the current epoch."""
+    """4-phase schedule: soft → stoch → ramp → stationary."""
     if epoch <= cfg.phase1_end:
         return "soft", 0.0
     if epoch <= cfg.phase2_end:
         return "stochastic", 0.0
-    # Phase 3: stochastic + KL ramp
-    ramp_len = max(cfg.epochs - cfg.phase2_end, 1)
-    frac = (epoch - cfg.phase2_end) / ramp_len
-    return "stochastic", min(frac, 1.0)
+    if epoch <= cfg.phase3_end:
+        # Phase 3: KL ramp 0 → 1.0
+        ramp_len = max(cfg.phase3_end - cfg.phase2_end, 1)
+        frac = (epoch - cfg.phase2_end) / ramp_len
+        return "stochastic", min(frac, 1.0)
+    # Phase 4: stationary at β=final
+    return "stochastic", 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +172,26 @@ def train(cfg: TrainConfig) -> None:
         k_min=cfg.k_min,
     ).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    # Separate param groups: dict learns slower
+    dict_params = list(model.latent.dictionary.parameters())
+    dict_ids = {id(p) for p in dict_params}
+    other_params = [p for p in model.parameters() if id(p) not in dict_ids]
+    optimizer = torch.optim.Adam([
+        {"params": other_params, "lr": cfg.lr},
+        {"params": dict_params, "lr": cfg.lr * cfg.dict_lr_mult, "name": "dict"},
+    ])
+
+    # Store initial dict for drift measurement
+    dict_init_snapshot = model.latent.dictionary.get_atoms().clone()
+
+    # LR schedule: constant through P1-P3, cosine decay in P4
+    def get_lr(epoch: int) -> float:
+        if epoch <= cfg.phase3_end:
+            return cfg.lr
+        # Cosine decay from lr → lr/10 during Phase 4
+        frac = (epoch - cfg.phase3_end) / max(cfg.epochs - cfg.phase3_end, 1)
+        lr_min = cfg.lr / 10.0
+        return lr_min + 0.5 * (cfg.lr - lr_min) * (1 + math.cos(math.pi * frac))
 
     # Temperature schedule (Gumbel-Softmax)
     def get_temp(epoch: int) -> float:
@@ -179,6 +208,19 @@ def train(cfg: TrainConfig) -> None:
         temp = get_temp(epoch)
         sampling_mode, beta_frac = get_phase(epoch, cfg)
 
+        # Update LR (cosine decay in P4)
+        current_lr = get_lr(epoch)
+        for pg in optimizer.param_groups:
+            if pg.get('name') == 'dict':
+                pg['lr'] = current_lr * cfg.dict_lr_mult
+            else:
+                pg['lr'] = current_lr
+
+        # Freeze/unfreeze dictionary
+        dict_frozen = epoch <= cfg.freeze_dict_until
+        for p in dict_params:
+            p.requires_grad = not dict_frozen
+
         # Effective betas for this epoch
         eff_beta_gamma = beta_frac * cfg.beta_gamma_final
         eff_beta_delta = beta_frac * cfg.beta_delta_final
@@ -188,8 +230,10 @@ def train(cfg: TrainConfig) -> None:
             phase_label = "P1:soft"
         elif epoch <= cfg.phase2_end:
             phase_label = "P2:stoch"
+        elif epoch <= cfg.phase3_end:
+            phase_label = "P3:ramp"
         else:
-            phase_label = "P3:KL"
+            phase_label = "P4:conv"
 
         epoch_loss = 0.0
         epoch_metrics: dict[str, float] = {
@@ -235,6 +279,12 @@ def train(cfg: TrainConfig) -> None:
             k_active = k_all[active_mask].mean().item() if active_mask.any() else 0.0
             n_active = active_mask.float().sum(-1).mean().item()
             sparsity = (delta == 0).float().mean().item()
+            # Dictionary drift from initialization
+            current_atoms = model.latent.dictionary.get_atoms()
+            dict_drift = 1.0 - F.cosine_similarity(
+                current_atoms.flatten().unsqueeze(0),
+                dict_init_snapshot.flatten().unsqueeze(0),
+            ).item()
             log.info(
                 f"Epoch {epoch:4d} [{phase_label}] | "
                 f"loss {epoch_loss/n_batches:.4f} | "
@@ -243,7 +293,8 @@ def train(cfg: TrainConfig) -> None:
                 f"k̄={k_mean:.3f}  k_act={k_active:.3f}  "
                 f"n_act={n_active:.1f}/{cfg.n_atoms}  "
                 f"δ₀={sparsity:.2%}  "
-                f"β={eff_beta_gamma:.4f}  τ={temp:.3f}"
+                f"β={eff_beta_gamma:.4f}  τ={temp:.3f}  "
+                f"Δdict={dict_drift:.4f}"
             )
 
     # ---- Save ----------------------------------------------------------

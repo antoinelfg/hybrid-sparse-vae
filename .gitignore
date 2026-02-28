@@ -10,3 +10,8 @@ checkpoints/
 *.egg-info/
 dist/
 build/
+*.log
+*.out
+*.err
+*.png
+*.sh
