@@ -36,6 +36,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class TrainConfig:
     # Data
+    dataset: str = "sinusoid"           # "sinusoid", "mnist", "audio"
     data_dir: str = "./data"
     input_channels: int = 1
     input_length: int = 128
@@ -47,13 +48,29 @@ class TrainConfig:
     encoder_output_dim: int = 256
     encoder_type: str = "linear"       # "linear" (toy) or "resnet" (real data)
     decoder_type: str = "linear"       # "linear" (toy) or "resnet" (real data)
-    dict_init: str = "dct"
+    dict_init: str = "random"
     normalize_dict: bool = True
     k_min: float = 0.1
 
     # Dictionary learning
     freeze_dict_until: int = 0          # freeze dict weights until this epoch (0=always learn)
     dict_lr_mult: float = 0.1           # dict LR = lr * dict_lr_mult (slower adaptation)
+    
+    # Warmup strategies (dict stability)
+    dict_warmup_epochs: int = 0         # freeze dict for first N epochs
+    dict_lr_warmup: bool = False        # linear LR warmup for dict params over first 200 epochs
+    gradient_clip_dict: float = 1.0     # separate grad clip for dict
+    
+    # Ablations
+    magnitude_dist: str = "gamma"       # "gamma" or "gaussian"
+    structure_mode: str = "ternary"     # "ternary" or "binary"
+    spectrogram_enhancements: bool = True # Force non-negativity, instance norm, higher sparsity for spectrograms
+
+    # WandB
+    use_wandb: bool = False
+    wandb_project: str = "hybrid-sparse-vae"
+    wandb_entity: str = ""
+    wandb_run_name: str = ""
 
     # Training
     lr: float = 3e-4
@@ -146,19 +163,65 @@ def get_phase(epoch: int, cfg: TrainConfig) -> tuple[str, float]:
 # ---------------------------------------------------------------------------
 
 def train(cfg: TrainConfig) -> None:
+    if cfg.use_wandb:
+        try:
+            import wandb
+            wandb.init(
+                project=cfg.wandb_project,
+                entity=cfg.wandb_entity if cfg.wandb_entity else None,
+                name=cfg.wandb_run_name if cfg.wandb_run_name else None,
+                config=vars(cfg) if not isinstance(cfg, DictConfig) else OmegaConf.to_container(cfg, resolve=True),
+            )
+        except ImportError:
+            log.warning("wandb not installed. Run `pip install wandb` to use it. Disabling wandb.")
+            cfg.use_wandb = False
+
     torch.manual_seed(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
 
     # ---- Data ----------------------------------------------------------
-    dataset = make_toy_data(
-        n_samples=2000,
-        length=cfg.input_length,
-        n_components=3,
-        seed=cfg.seed,
-    )
+    dataset_name = cfg.dataset.lower()
+    
+    if dataset_name == "sinusoid":
+        dataset = make_toy_data(
+            n_samples=2000,
+            length=cfg.input_length,
+            n_components=3,
+            seed=cfg.seed,
+        )
+    elif dataset_name == "mnist":
+        from data.datasets import get_mnist_dataset
+        dataset = get_mnist_dataset(data_dir=cfg.data_dir, flatten=True)
+    elif dataset_name == "audio":
+        from data.datasets import get_audio_spectrogram_dataset
+        # For our 1D convolutions, we treat n_mels as channels and time_steps as length.
+        # But wait, our get_audio_spectrogram_dataset returns [N, C, T] where C=n_mels.
+        # So we MUST adjust input_channels and input_length if we plan to use audio.
+        dataset = get_audio_spectrogram_dataset(
+            data_dir=cfg.data_dir,
+            n_samples=2000,
+            n_mels=cfg.input_channels,
+            time_steps=cfg.input_length,
+            use_instance_norm=cfg.spectrogram_enhancements
+        )
+    elif dataset_name == "fsdd":
+        from data.datasets import get_fsdd_dataset
+        # For our purposes we assume defaults n_fft=256, hop_length=128, max_frames=64
+        # to match input_channels=1, input_length=8256
+        dataset = get_fsdd_dataset(
+            data_dir=f"{cfg.data_dir}/fsdd",
+            use_instance_norm=cfg.spectrogram_enhancements
+        )
+    else:
+        raise ValueError(f"Unknown dataset: {cfg.dataset}")
     loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True)
 
     # ---- Model ---------------------------------------------------------
+    if cfg.spectrogram_enhancements and dataset_name in ["fsdd", "audio"]:
+        log.info("Spectrograms detected: Increasing sparsity and enforcing non-negative decoder.")
+        cfg.k_min = 0.01  # lowered to tax the usage of a super-atom
+        cfg.beta_gamma_final = max(cfg.beta_gamma_final, 0.05)
+
     model = HybridSparseVAE(
         input_channels=cfg.input_channels,
         input_length=cfg.input_length,
@@ -170,7 +233,21 @@ def train(cfg: TrainConfig) -> None:
         dict_init=cfg.dict_init,
         normalize_dict=cfg.normalize_dict,
         k_min=cfg.k_min,
+        magnitude_dist=cfg.magnitude_dist,
+        structure_mode=cfg.structure_mode,
     ).to(device)
+
+    # Enforce Non-negative decoder weights for spectrograms
+    if cfg.spectrogram_enhancements and dataset_name in ["fsdd", "audio"]:
+        import torch.nn.utils.parametrize as parametrize
+        
+        class NonNegativeWeight(torch.nn.Module):
+            def forward(self, x):
+                return torch.nn.functional.softplus(x)
+                
+        for mod in model.decoder.modules():
+            if isinstance(mod, (torch.nn.Linear, torch.nn.Conv1d)):
+                parametrize.register_parametrization(mod, "weight", NonNegativeWeight())
 
     # Separate param groups: dict learns slower
     dict_params = list(model.latent.dictionary.parameters())
@@ -212,12 +289,16 @@ def train(cfg: TrainConfig) -> None:
         current_lr = get_lr(epoch)
         for pg in optimizer.param_groups:
             if pg.get('name') == 'dict':
-                pg['lr'] = current_lr * cfg.dict_lr_mult
+                if cfg.dict_lr_warmup and epoch <= 200:
+                    warmup_factor = epoch / 200.0
+                    pg['lr'] = current_lr * cfg.dict_lr_mult * warmup_factor
+                else:
+                    pg['lr'] = current_lr * cfg.dict_lr_mult
             else:
                 pg['lr'] = current_lr
 
-        # Freeze/unfreeze dictionary
-        dict_frozen = epoch <= cfg.freeze_dict_until
+        # Freeze/unfreeze dictionary (combine explicit freeze with warmup)
+        dict_frozen = epoch <= max(cfg.freeze_dict_until, cfg.dict_warmup_epochs)
         for p in dict_params:
             p.requires_grad = not dict_frozen
 
@@ -259,10 +340,16 @@ def train(cfg: TrainConfig) -> None:
                 prior_probs=delta_prior_t,
                 beta_gamma=eff_beta_gamma,
                 beta_delta=eff_beta_delta,
+                magnitude_dist=cfg.magnitude_dist,
             )
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            
+            # Separate gradient clipping for dictionary stability
+            torch.nn.utils.clip_grad_norm_(other_params, max_norm=5.0)
+            if not dict_frozen:
+                torch.nn.utils.clip_grad_norm_(dict_params, max_norm=cfg.gradient_clip_dict)
+                
             optimizer.step()
 
             epoch_loss += loss.item()
@@ -296,11 +383,34 @@ def train(cfg: TrainConfig) -> None:
                 f"β={eff_beta_gamma:.4f}  τ={temp:.3f}  "
                 f"Δdict={dict_drift:.4f}"
             )
+            
+            if cfg.use_wandb:
+                import wandb
+                wandb.log({
+                    "epoch": epoch,
+                    "loss": epoch_loss / n_batches,
+                    "recon": avg["recon"],
+                    "kl_gamma": avg["kl_gamma"],
+                    "kl_delta": avg["kl_delta"],
+                    "k_mean": k_mean,
+                    "k_active": k_active,
+                    "n_active": n_active,
+                    "sparsity": sparsity,
+                    "dict_drift": dict_drift,
+                    "phase_beta_gamma": eff_beta_gamma,
+                    "phase_beta_delta": eff_beta_delta,
+                    "temp": temp,
+                })
 
     # ---- Save ----------------------------------------------------------
     ckpt_path = Path(cfg.save_dir) / "hybrid_vae_final.pt"
     torch.save(model.state_dict(), ckpt_path)
     log.info(f"Saved checkpoint → {ckpt_path}")
+    
+    if cfg.use_wandb:
+        import wandb
+        wandb.save(str(ckpt_path))
+        wandb.finish()
 
 
 # ---------------------------------------------------------------------------

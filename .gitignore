@@ -10,8 +10,20 @@ checkpoints/
 *.egg-info/
 dist/
 build/
+
+# SLURM & runtime outputs (keep in results/ but don't track)
 *.log
 *.out
 *.err
+
+# Generated images
 *.png
-*.sh
+
+# Data (regenerated at runtime)
+data/
+
+# Results (too large for git)
+results/
+
+# Internal report / notes (not for git)
+report/

@@ -57,6 +57,27 @@ def kl_gamma(
 
 
 # ---------------------------------------------------------------------------
+#  KL Divergence: Gaussian (for ablations)
+# ---------------------------------------------------------------------------
+
+def kl_gaussian(
+    mu: Tensor,
+    std: Tensor,
+    prior_mu: Tensor | float = 0.0,
+    prior_std: Tensor | float = 1.0,
+) -> Tensor:
+    """Exact KL(N(mu, std^2) ‖ N(prior_mu, prior_std^2)), summed over all elements."""
+    prior_mu = torch.as_tensor(prior_mu, dtype=mu.dtype, device=mu.device)
+    prior_std = torch.as_tensor(prior_std, dtype=mu.dtype, device=mu.device)
+    
+    var = std.pow(2)
+    prior_var = prior_std.pow(2)
+    
+    kl = torch.log(prior_std) - torch.log(std) + (var + (mu - prior_mu).pow(2)) / (2 * prior_var) - 0.5
+    return kl.sum()
+
+
+# ---------------------------------------------------------------------------
 #  KL Divergence: Categorical (ternary structure)
 # ---------------------------------------------------------------------------
 
@@ -97,6 +118,7 @@ def compute_hybrid_loss(
     prior_probs: Tensor | None = None,
     beta_gamma: float = 1.0,
     beta_delta: float = 1.0,
+    magnitude_dist: str = "gamma",
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Full ELBO = Reconstruction + β_γ · KL_Gamma + β_δ · KL_Categorical.
 
@@ -127,8 +149,13 @@ def compute_hybrid_loss(
     batch_size = x.size(0)
     recon_loss = F.mse_loss(x_recon, x, reduction="sum") / batch_size
 
-    # 2. KL Gamma
-    kl_g = kl_gamma(params["k"], params["theta"], k_0, theta_0) / batch_size
+    # 2. KL Magnitude (Gamma or Gaussian)
+    if magnitude_dist == "gamma":
+        kl_g = kl_gamma(params["k"], params["theta"], k_0, theta_0) / batch_size
+    elif magnitude_dist == "gaussian":
+        kl_g = kl_gaussian(params["k"], params["theta"], prior_mu=0.0, prior_std=1.0) / batch_size
+    else:
+        raise ValueError(f"Unknown magnitude_dist: {magnitude_dist}")
 
     # 3. KL Categorical
     kl_d = kl_categorical(params["logits"], prior_probs) / batch_size

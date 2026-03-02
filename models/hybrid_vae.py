@@ -53,12 +53,12 @@ class LinearEncoder1D(nn.Module):
 
 
 class LinearDecoder1D(nn.Module):
-    """Deliberately simple decoder: z → Linear → ReLU → Linear → output."""
+    """Truly strictly linear decoder: z → Linear → output."""
 
     def __init__(
         self,
         latent_dim: int = 128,
-        hidden_dim: int = 256,
+        hidden_dim: int = 256,  # Ignored for strict linearity, kept for signature compat
         output_channels: int = 1,
         output_length: int = 128,
     ):
@@ -66,11 +66,7 @@ class LinearDecoder1D(nn.Module):
         self.output_channels = output_channels
         self.output_length = output_length
         self.net = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, output_channels * output_length),
+            nn.Linear(latent_dim, output_channels * output_length),
         )
 
     def forward(self, z: Tensor) -> Tensor:
@@ -113,6 +109,8 @@ class HybridSparseVAE(nn.Module):
         dict_init: str = "dct",
         normalize_dict: bool = True,
         k_min: float = 0.1,
+        magnitude_dist: str = "gamma",
+        structure_mode: str = "ternary",
     ):
         super().__init__()
 
@@ -139,6 +137,8 @@ class HybridSparseVAE(nn.Module):
             dict_init=dict_init,
             normalize_dict=normalize_dict,
             k_min=k_min,
+            magnitude_dist=magnitude_dist,
+            structure_mode=structure_mode,
         )
 
         # ---- Decoder ---------------------------------------------------
