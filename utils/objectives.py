@@ -96,9 +96,16 @@ def kl_categorical(
         Default: sparsity-inducing ``[0.05, 0.90, 0.05]``.
     """
     if prior_probs is None:
-        prior_probs = torch.tensor(
-            [0.05, 0.90, 0.05], dtype=logits.dtype, device=logits.device
-        )
+        if logits.shape[-1] == 3:
+            prior_probs = torch.tensor(
+                [0.05, 0.90, 0.05], dtype=logits.dtype, device=logits.device
+            )
+        elif logits.shape[-1] == 2:
+            prior_probs = torch.tensor(
+                [0.90, 0.10], dtype=logits.dtype, device=logits.device
+            )
+        else:
+            raise ValueError(f"Unsupported logits dimension: {logits.shape[-1]}")
 
     q = dist.Categorical(logits=logits)
     p = dist.Categorical(probs=prior_probs)

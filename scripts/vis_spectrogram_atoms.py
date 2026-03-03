@@ -78,18 +78,6 @@ def main():
     print(f"Loading {args.checkpoint}...")
     model = build_model(args)
     
-    # Enforce Non-negative decoder weights for spectrograms (must match train.py)
-    if args.spectrogram_enhancements and args.dataset in ["fsdd", "audio"]:
-        import torch.nn.utils.parametrize as parametrize
-        
-        class NonNegativeWeight(torch.nn.Module):
-            def forward(self, x):
-                return torch.nn.functional.softplus(x)
-                
-        for mod in model.decoder.modules():
-            if isinstance(mod, (torch.nn.Linear, torch.nn.Conv1d)):
-                parametrize.register_parametrization(mod, "weight", NonNegativeWeight())
-
     model.load_state_dict(load_state_dict(Path(args.checkpoint), device))
     model.to(device)
     model.eval()
@@ -105,7 +93,7 @@ def main():
                           n_fft=args.n_fft, hop_length=args.hop_length, max_frames=args.max_frames,
                           use_instance_norm=args.spectrogram_enhancements)
     loader = DataLoader(ds, batch_size=256, shuffle=True)
-    batch_x, = next(iter(loader))
+    batch_x, _ = next(iter(loader))
     batch_x = batch_x.to(device)
 
     with torch.no_grad():
@@ -215,7 +203,7 @@ def main():
         sm = plt.cm.ScalarMappable(cmap=border_cmap, norm=border_norm)
         sm.set_array([])
         cbar = fig.colorbar(sm, cax=ax_cbar)
-        cbar.set_label('Activation Prob $\mathbb{E}[|\delta|]$', fontsize=18, labelpad=15)
+        cbar.set_label(r'Activation Prob $\mathbb{E}[|\delta|]$', fontsize=18, labelpad=15)
         cbar.outline.set_edgecolor(text_color)
         
         plt.savefig(out_path / filename, bbox_inches='tight', facecolor=bg_color, dpi=120)

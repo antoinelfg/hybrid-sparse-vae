@@ -74,6 +74,33 @@ class LinearDecoder1D(nn.Module):
         return out.view(z.size(0), self.output_channels, self.output_length)
 
 
+class NonNegativeLinearDecoder(nn.Module):
+    """Truly strictly linear decoder with non-negative weights for NMF.
+    
+    Weights are forced to be positive via softplus and bias is disabled
+    to ensure that zero latent activation yields zero physical output.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 128,
+        hidden_dim: int = 256,  # Ignored for strict linearity, kept for signature compat
+        output_channels: int = 1,
+        output_length: int = 128,
+    ):
+        super().__init__()
+        self.output_channels = output_channels
+        self.output_length = output_length
+        # No bias for pure NMF
+        self.net = nn.Linear(latent_dim, output_channels * output_length, bias=False)
+
+    def forward(self, z: Tensor) -> Tensor:
+        # Dynamically force weights to be positive
+        W_pos = torch.nn.functional.softplus(self.net.weight)
+        out = torch.nn.functional.linear(z, W_pos)  # [B, C*T]
+        return out.view(z.size(0), self.output_channels, self.output_length)
+
+
 class HybridSparseVAE(nn.Module):
     """End-to-end Hybrid Sparse VAE.
 
@@ -144,6 +171,13 @@ class HybridSparseVAE(nn.Module):
         # ---- Decoder ---------------------------------------------------
         if decoder_type == "linear":
             self.decoder = LinearDecoder1D(
+                latent_dim=latent_dim,
+                hidden_dim=256,
+                output_channels=input_channels,
+                output_length=input_length,
+            )
+        elif decoder_type == "linear_positive":
+            self.decoder = NonNegativeLinearDecoder(
                 latent_dim=latent_dim,
                 hidden_dim=256,
                 output_channels=input_channels,

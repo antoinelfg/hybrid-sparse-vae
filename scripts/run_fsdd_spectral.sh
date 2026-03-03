@@ -17,11 +17,11 @@ set -e
 python train.py \
     dataset="fsdd" \
     input_channels=1 \
-    input_length=8256 \
-    decoder_type="linear" \
-    encoder_type="linear" \
+    decoder_type="linear_positive" \
+    encoder_type="mlp" \
     n_atoms=64 \
     latent_dim=32 \
+    dict_init="random_positive" \
     k_min=0.01 \
     magnitude_dist="gamma" \
     structure_mode="ternary" \

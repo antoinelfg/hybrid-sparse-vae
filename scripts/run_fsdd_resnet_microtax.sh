@@ -1,0 +1,30 @@
+#!/bin/bash
+#SBATCH --job-name=fsdd_microtax
+#SBATCH --output=fsdd_microtax_%j.out
+#SBATCH --error=fsdd_microtax_%j.err
+#SBATCH --time=24:00:00
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --mem=32G
+
+source ~/.bashrc
+conda activate base
+
+python train.py \
+    dataset="fsdd" \
+    input_length=8256 \
+    decoder_type="linear_positive" \
+    encoder_type="resnet" \
+    n_atoms=128 \
+    latent_dim=32 \
+    dict_init="random_positive" \
+    k_min=0.01 \
+    magnitude_dist="gamma" \
+    structure_mode="binary" \
+    epochs=2000 \
+    phase1_end=400 \
+    phase2_end=800 \
+    phase3_end=1200 \
+    beta_delta_final=0.005 \
+    beta_gamma_final=0.001 \
+    save_dir="./checkpoints/fsdd_nmf_resnet_microtax"

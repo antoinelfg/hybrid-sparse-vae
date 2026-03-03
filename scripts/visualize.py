@@ -73,14 +73,15 @@ def main():
                         help="Output directory for figures (default: <results-dir>/figures/)")
 
     # Model config overrides
-    parser.add_argument("--dict-init", type=str, default="dct",
-                        choices=["dct", "random", "identity"])
+    parser.add_argument("--dict-init", type=str, default="dct")
     parser.add_argument("--n-atoms", type=int, default=128)
     parser.add_argument("--latent-dim", type=int, default=64)
     parser.add_argument("--encoder-output-dim", type=int, default=256)
     parser.add_argument("--input-length", type=int, default=128)
     parser.add_argument("--encoder-type", type=str, default="linear")
     parser.add_argument("--decoder-type", type=str, default="linear")
+    parser.add_argument("--magnitude-dist", type=str, default="gamma")
+    parser.add_argument("--structure-mode", type=str, default="ternary")
 
     # Data config
     parser.add_argument("--seed", type=int, default=42)

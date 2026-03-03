@@ -15,7 +15,7 @@ where $\gamma \sim \text{Gamma}(k, \theta)$ with $k < 1$ (super-Gaussian sparsit
 3. **Exact KL divergences** — no Monte-Carlo estimation of regularization terms
 4. **4-Phase "Rocket Launch" training** — progressive curriculum: soft→stochastic→KL ramp→convergence
 
-## 🏆 Key Results & Baselines (Toy Sinusoids)
+## Key Results & Baselines (Toy Sinusoids)
 
 We accept a reconstruction cost vs. iterative matching pursuit (OMP) in exchange for **one-shot amortized inference**, **generative sampling**, and **interpretable polar decomposition** — while outperforming all comparable structured generative baselines at iso-sparsity.
 
@@ -81,7 +81,7 @@ Phase 3 [ep 501-1000]  stochastic, β ramp 0→max   → gradual KL & sparsifica
 Phase 4 [ep 1001-3000] stochastic, β=max          → cosine LR decay to convergence
 ```
 
-## 🚀 Experimental Campaigns & Discoveries
+## Experimental Campaigns & Discoveries
 
 ### 1. MNIST "Cold Start" Campaign
 High-dimensional dense images (MNIST) impose a strict **"Noise Floor"** on the Gamma shape parameter $k$. When $k < 1$, the multiplicative noise ($1/\sqrt{k}$) exceeds 100%, causing catastrophic variance explosion and posterior collapse. By enforcing a stability constraint ($k_{min}=10$) and skipping the deterministic warmup ("Cold Start"), we decouple sparsity (handled strictly by ternary $\delta$) from magnitude noise:

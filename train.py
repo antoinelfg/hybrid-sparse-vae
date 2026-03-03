@@ -214,13 +214,18 @@ def train(cfg: TrainConfig) -> None:
         )
     else:
         raise ValueError(f"Unknown dataset: {cfg.dataset}")
+        
     loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True)
 
-    # ---- Model ---------------------------------------------------------
-    if cfg.spectrogram_enhancements and dataset_name in ["fsdd", "audio"]:
-        log.info("Spectrograms detected: Increasing sparsity and enforcing non-negative decoder.")
-        cfg.k_min = 0.01  # lowered to tax the usage of a super-atom
-        cfg.beta_gamma_final = max(cfg.beta_gamma_final, 0.05)
+    # ---- Auto-detect shape to avoid magic constants --------------------
+    if len(dataset) > 0:
+        sample_x = dataset[0][0]  # TensorDataset returns tuples
+        if sample_x.dim() == 2:
+            cfg.input_channels = sample_x.shape[0]
+            cfg.input_length = sample_x.shape[1]
+        elif sample_x.dim() == 1:
+            cfg.input_channels = 1
+            cfg.input_length = sample_x.shape[0]
 
     model = HybridSparseVAE(
         input_channels=cfg.input_channels,
@@ -236,18 +241,6 @@ def train(cfg: TrainConfig) -> None:
         magnitude_dist=cfg.magnitude_dist,
         structure_mode=cfg.structure_mode,
     ).to(device)
-
-    # Enforce Non-negative decoder weights for spectrograms
-    if cfg.spectrogram_enhancements and dataset_name in ["fsdd", "audio"]:
-        import torch.nn.utils.parametrize as parametrize
-        
-        class NonNegativeWeight(torch.nn.Module):
-            def forward(self, x):
-                return torch.nn.functional.softplus(x)
-                
-        for mod in model.decoder.modules():
-            if isinstance(mod, (torch.nn.Linear, torch.nn.Conv1d)):
-                parametrize.register_parametrization(mod, "weight", NonNegativeWeight())
 
     # Separate param groups: dict learns slower
     dict_params = list(model.latent.dictionary.parameters())
@@ -321,7 +314,8 @@ def train(cfg: TrainConfig) -> None:
             "recon": 0.0, "kl_gamma": 0.0, "kl_delta": 0.0
         }
 
-        for (batch_x,) in loader:
+        for batch in loader:
+            batch_x = batch[0]
             batch_x = batch_x.to(device)
             optimizer.zero_grad()
 
@@ -329,6 +323,13 @@ def train(cfg: TrainConfig) -> None:
 
             # Parse delta prior
             dp = [float(v) for v in cfg.delta_prior.split(",")]
+            
+            # Auto-adapt prior to structure mode
+            if cfg.structure_mode == "binary" and len(dp) == 3:
+                dp = [dp[1], dp[0] + dp[2]]  # [P(0), P(-1) + P(+1)]
+            elif cfg.structure_mode == "ternary" and len(dp) == 2:
+                dp = [dp[1]/2, dp[0], dp[1]/2]  # Split P(active) to -1 and +1
+                
             delta_prior_t = torch.tensor(dp, device=device)
 
             loss, metrics = compute_hybrid_loss(

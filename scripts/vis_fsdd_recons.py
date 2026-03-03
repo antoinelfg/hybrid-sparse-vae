@@ -60,18 +60,6 @@ def main():
     # 1. Load Model
     print(f"Loading model from {args.checkpoint}...")
     model = build_model(args)
-    
-    # Enforce Non-negative decoder weights for spectrograms (must match train.py)
-    if args.spectrogram_enhancements and args.dataset in ["fsdd", "audio"]:
-        import torch.nn.utils.parametrize as parametrize
-        
-        class NonNegativeWeight(torch.nn.Module):
-            def forward(self, x):
-                return torch.nn.functional.softplus(x)
-                
-        for mod in model.decoder.modules():
-            if isinstance(mod, (torch.nn.Linear, torch.nn.Conv1d)):
-                parametrize.register_parametrization(mod, "weight", NonNegativeWeight())
 
     model.load_state_dict(torch.load(args.checkpoint, map_location=device))
     model.to(device).eval()
@@ -117,10 +105,15 @@ def main():
     # Simplified Griffin-Lim: random phase + iterative refinement (or just random phase for quick check)
     # Since we only have magnitude, audio quality will be 'robotic' but recognizable.
     
-    def griffin_lim(mag, n_fft, hop_length, iterations=32):
+    def griffin_lim(mag_norm, n_fft, hop_length, iterations=32):
+        # Invert the log10([0, 1]) normalization applied in datasets.py
+        # Assume mag_norm in [0, 1] represents an 80dB dynamic range (-80dB to 0dB)
+        db_spec = mag_norm * 80.0 - 80.0
+        mag_linear = 10.0 ** (db_spec / 20.0)
+        
         # Start with random phase
-        phase = np.exp(2j * np.pi * np.random.rand(*mag.shape))
-        complex_spec = mag * phase
+        phase = np.exp(2j * np.pi * np.random.rand(*mag_linear.shape))
+        complex_spec = mag_linear * phase
         
         # Iterative reconstruction (using CPU for simplicity)
         y = torch.istft(torch.from_numpy(complex_spec), n_fft=n_fft, hop_length=hop_length, 
@@ -132,7 +125,7 @@ def main():
                               window=torch.hann_window(n_fft), center=True, return_complex=True)
             # Replace magnitude with the model's magnitude
             phase = torch.angle(stft)
-            consistent_spec = torch.from_numpy(mag) * torch.exp(1j * phase)
+            consistent_spec = torch.from_numpy(mag_linear) * torch.exp(1j * phase)
             # ISTFT back to time
             y = torch.istft(consistent_spec, n_fft=n_fft, hop_length=hop_length, 
                             window=torch.hann_window(n_fft), center=True)

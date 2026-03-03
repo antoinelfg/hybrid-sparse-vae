@@ -55,6 +55,8 @@ class DictionaryMatrix(nn.Module):
             weight = self._dct_init(latent_dim, n_atoms)
         elif init == "identity":
             weight = self._identity_init(latent_dim, n_atoms)
+        elif init == "random_positive":
+            nn.init.uniform_(weight, 0.0, 1.0)
         else:  # "random"
             nn.init.xavier_uniform_(weight)
 
