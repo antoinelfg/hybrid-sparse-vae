@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 
@@ -82,6 +83,7 @@ class Encoder1D(nn.Module):
         input_channels: int = 1,
         hidden_channels: list[int] | None = None,
         output_dim: int = 256,
+        spatial_pooling: bool = False,
     ):
         super().__init__()
         if hidden_channels is None:
@@ -94,8 +96,10 @@ class Encoder1D(nn.Module):
             in_ch = out_ch
 
         self.backbone = nn.Sequential(*layers)
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(in_ch, output_dim)
+        self.spatial_pooling = spatial_pooling
+        if self.spatial_pooling:
+            self.pool = nn.AdaptiveAvgPool1d(1)
+        self.conv_out = nn.Conv1d(in_ch, output_dim, kernel_size=1)
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -105,12 +109,114 @@ class Encoder1D(nn.Module):
 
         Returns
         -------
-        h : Tensor  — ``[B, output_dim]``
+        h : Tensor  — ``[B, output_dim, T']`` or ``[B, output_dim]`` if spatial_pooling
         """
-        h = self.backbone(x)       # [B, last_ch, T']
-        h = self.pool(h).squeeze(-1)  # [B, last_ch]
-        h = self.fc(h)              # [B, output_dim]
+        h = self.backbone(x)        # [B, last_ch, T']
+        if self.spatial_pooling:
+            h = self.pool(h)        # [B, last_ch, 1]
+        h = self.conv_out(h)        # [B, output_dim, T'] or [B, output_dim, 1]
+        
+        if self.spatial_pooling:
+            h = h.squeeze(-1)       # [B, output_dim]
+            
         return h
+
+
+# ---------------------------------------------------------------------------
+#  Convolutional Unrolled LISTA Inference Encoder
+# ---------------------------------------------------------------------------
+
+class ConvUnrolledISTAEncoder(nn.Module):
+    """Convolutional LISTA (Learned ISTA) encoder for iterative amortized inference.
+
+    Instead of a single feed-forward pass, the encoder performs ``n_iterations``
+    recurrent steps of the form::
+
+        h_t = ReLU(W_x * X + W_h * h_{t-1})
+
+    where:
+      - ``W_x`` performs the initial projection (equivalent to Aᵀ X in ISTA)
+      - ``W_h`` models mutual inhibition between atoms (equivalent to Aᵀ A)
+
+    After ``n_iterations``, dedicated heads project ``h`` to the parameters
+    of the Gamma and Gumbel-Softmax distributions, preserving the time axis.
+
+    This architecture closes the *amortization gap* at the cost of ``n_iterations``
+    forward passes through ``W_h``, and is compatible with the ConvNMF decoder
+    (``decoder_type="convnmf"``).
+
+    Parameters
+    ----------
+    input_channels : int
+        Number of input channels (e.g., 1 for waveform).
+    n_atoms : int
+        Dimension of the sparse code / number of atoms in the dictionary.
+    n_iterations : int
+        Number of LISTA unrolling steps (K in the paper). Default: 3.
+    kernel_size : int
+        Kernel size for ``W_x`` projection. Should match encoder stride (default 16).
+    structure_mode : str
+        ``"ternary"`` (3 classes: -1, 0, +1) or ``"binary"`` (2 classes: 0, 1).
+    """
+
+    def __init__(
+        self,
+        input_channels: int = 1,
+        n_atoms: int = 64,
+        n_iterations: int = 3,
+        kernel_size: int = 16,
+        structure_mode: str = "ternary",
+    ):
+        super().__init__()
+        self.n_iterations = n_iterations
+        self.n_atoms = n_atoms
+        self.n_classes = 3 if structure_mode == "ternary" else 2
+
+        # W_x: initial projection (preserves time with stride=kernel_size)
+        self.W_x = nn.Conv1d(
+            input_channels, n_atoms, kernel_size=kernel_size, stride=kernel_size, padding=0, bias=True
+        )
+
+        # W_h: lateral inhibition / mutual inhibition between atoms
+        self.W_h = nn.Conv1d(n_atoms, n_atoms, kernel_size=1, bias=False)
+
+        # Parameter heads: all operate on the time axis with kernel_size=1
+        self.head_k = nn.Conv1d(n_atoms, n_atoms, kernel_size=1)      # Gamma shape (k)
+        self.head_theta = nn.Conv1d(n_atoms, n_atoms, kernel_size=1)  # Gamma scale (θ)
+        self.head_pi = nn.Conv1d(n_atoms, n_atoms * self.n_classes, kernel_size=1)  # Gumbel logits
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Parameters
+        ----------
+        x : Tensor — ``[B, input_channels, T]``
+
+        Returns
+        -------
+        k_out : Tensor — ``[B, n_atoms, T']``  Gamma shape parameter
+        theta_out : Tensor — ``[B, n_atoms, T']``  Gamma scale parameter
+        logits : Tensor — ``[B, n_atoms, T', n_classes]``  Gumbel-Softmax logits
+        """
+        B = x.size(0)
+
+        # 1. Project input into atom space
+        h_x = self.W_x(x)    # [B, n_atoms, T']
+
+        # 2. LISTA iterations
+        h = torch.zeros_like(h_x)
+        for _ in range(self.n_iterations):
+            h = F.relu(h_x + self.W_h(h))   # [B, n_atoms, T']
+
+        # 3. Project to distribution parameters
+        k_out = F.softplus(self.head_k(h)) + 1e-4        # [B, n_atoms, T']
+        theta_out = F.softplus(self.head_theta(h)) + 1e-4  # [B, n_atoms, T']
+
+        # 4. Logits: [B, n_atoms * n_classes, T'] → [B, n_atoms, T', n_classes]
+        T_prime = h.size(-1)
+        logits = self.head_pi(h).view(B, self.n_atoms, self.n_classes, T_prime)
+        logits = logits.permute(0, 1, 3, 2).contiguous()  # [B, n_atoms, T', n_classes]
+
+        return k_out, theta_out, logits
 
 
 # ---------------------------------------------------------------------------

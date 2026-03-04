@@ -1,22 +1,25 @@
 """Hybrid Sparse VAE — full generative model.
 
 Combines:
-  * Encoder/decoder backbones (linear or ResNet),
+  * Encoder/decoder backbones (linear, ResNet, or ConvLISTA),
   * A structured latent space with polar factorization (γ × δ), and
   * Exact KL-divergence losses (Gamma + Categorical).
 
 Encoder/Decoder modes:
   * ``"linear"`` — symmetric MLP (recommended for toy experiments)
   * ``"resnet"`` — deep Conv1D (for real data)
+  * ``"lista"`` — Convolutional Unrolled ISTA (closes amortization gap,
+                  compatible with ``decoder_type="convnmf"`` only)
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
-from modules.layers import Encoder1D, Decoder1D
+from modules.layers import Encoder1D, Decoder1D, ConvUnrolledISTAEncoder
 from modules.latent_space import StructuredLatentSpace
 
 
@@ -101,6 +104,53 @@ class NonNegativeLinearDecoder(nn.Module):
         return out.view(z.size(0), self.output_channels, self.output_length)
 
 
+class ShiftInvariantDecoder(nn.Module):
+    """Convolutional NMF (ConvNMF) Decoder.
+    
+    The dictionary A is the weight of a ConvTranspose1d layer.
+    W >= 0 is enforced by passing the weights through a softplus or absolute value.
+    """
+    
+    def __init__(self, n_atoms: int, n_freq_bins: int, motif_width: int = 16, output_length: int = 128, stride: int = 16):
+        super().__init__()
+        self.output_channels = n_freq_bins
+        self.stride = stride
+        self.motif_width = motif_width
+        self.output_length = output_length
+        
+        # On déclare les poids comme un Parameter classique.
+        # Shape: [in_channels (n_atoms), out_channels (output_channels), kernel_size]
+        self.weight = nn.Parameter(torch.Tensor(n_atoms, self.output_channels, motif_width))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        z : Tensor [Batch, n_atoms, Time]
+        """
+        # 1. Contrainte Physique NMF stricte (différentiable et propre)
+        W_pos = torch.abs(self.weight)  # ou F.softplus(self.weight)
+        
+        # 2. Convolution Transposée Fonctionnelle
+        # Le stride=16 va "espacer" les points temporels et le kernel (motif_width) va remplir l'espace.
+        x_recon = F.conv_transpose1d(
+            z, 
+            weight=W_pos, 
+            bias=None, 
+            stride=self.stride, 
+            padding=self.motif_width // 2
+        )
+        
+        # 3. Ajustement millimétrique (si besoin) au lieu d'une interpolation sauvage
+        # Si la taille dépasse légèrement 128 à cause des arrondis de padding, on coupe proprement.
+        if x_recon.shape[-1] > self.output_length:
+            x_recon = x_recon[..., :self.output_length]
+        elif x_recon.shape[-1] < self.output_length:
+            # If it's shorter, pad it
+            x_recon = F.pad(x_recon, (0, self.output_length - x_recon.shape[-1]))
+            
+        return x_recon
+
+
 class HybridSparseVAE(nn.Module):
     """End-to-end Hybrid Sparse VAE.
 
@@ -138,10 +188,15 @@ class HybridSparseVAE(nn.Module):
         k_min: float = 0.1,
         magnitude_dist: str = "gamma",
         structure_mode: str = "ternary",
+        motif_width: int = 16, # Added for convnmf
     ):
         super().__init__()
+        
+        self.temporal_mode = (decoder_type == "convnmf")
+        spatial_pooling = not self.temporal_mode
 
         # ---- Encoder ---------------------------------------------------
+        self.lista_mode = (encoder_type == "lista")
         if encoder_type == "linear":
             self.encoder = LinearEncoder1D(
                 input_channels=input_channels,
@@ -149,11 +204,20 @@ class HybridSparseVAE(nn.Module):
                 hidden_dim=256,
                 output_dim=encoder_output_dim,
             )
+        elif encoder_type == "lista":
+            self.encoder = ConvUnrolledISTAEncoder(
+                input_channels=input_channels,
+                n_atoms=n_atoms,
+                n_iterations=3,
+                kernel_size=motif_width,
+                structure_mode=structure_mode,
+            )
         else:
             self.encoder = Encoder1D(
                 input_channels=input_channels,
                 hidden_channels=encoder_hidden,
                 output_dim=encoder_output_dim,
+                spatial_pooling=spatial_pooling,
             )
 
         # ---- Structured Latent Space -----------------------------------
@@ -166,6 +230,7 @@ class HybridSparseVAE(nn.Module):
             k_min=k_min,
             magnitude_dist=magnitude_dist,
             structure_mode=structure_mode,
+            temporal_mode=self.temporal_mode,
         )
 
         # ---- Decoder ---------------------------------------------------
@@ -181,6 +246,13 @@ class HybridSparseVAE(nn.Module):
                 latent_dim=latent_dim,
                 hidden_dim=256,
                 output_channels=input_channels,
+                output_length=input_length,
+            )
+        elif decoder_type == "convnmf":
+            self.decoder = ShiftInvariantDecoder(
+                n_atoms=n_atoms,
+                n_freq_bins=input_channels,
+                motif_width=motif_width,
                 output_length=input_length,
             )
         else:
@@ -201,10 +273,22 @@ class HybridSparseVAE(nn.Module):
         temp: float = 1.0,
         sampling: str = "stochastic",
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        h = self.encoder(x)
-        z, info = self.latent(h, temp=temp, sampling=sampling)
+        if self.lista_mode:
+            # LISTA encoder returns (k, theta, logits) directly — skip conv_params head
+            k, theta, logits = self.encoder(x)
+            z, info = self.latent.forward_from_params(k, theta, logits, temp=temp, sampling=sampling)
+        else:
+            h = self.encoder(x)
+            z, info = self.latent(h, temp=temp, sampling=sampling)
         x_recon = self.decoder(z)
 
         info["x_recon"] = x_recon
         return x_recon, info
+
+    def get_dict_atoms(self) -> torch.Tensor:
+        """Returns the dictionary weights safely across architectural variations."""
+        if self.temporal_mode:
+            return self.decoder.weight.data
+        else:
+            return self.latent.dictionary.get_atoms()
 

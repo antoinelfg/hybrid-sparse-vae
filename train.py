@@ -243,7 +243,11 @@ def train(cfg: TrainConfig) -> None:
     ).to(device)
 
     # Separate param groups: dict learns slower
-    dict_params = list(model.latent.dictionary.parameters())
+    if getattr(model.latent, "temporal_mode", False):
+        dict_params = list(model.decoder.parameters())
+    else:
+        dict_params = list(model.latent.dictionary.parameters())
+    
     dict_ids = {id(p) for p in dict_params}
     other_params = [p for p in model.parameters() if id(p) not in dict_ids]
     optimizer = torch.optim.Adam([
@@ -252,7 +256,7 @@ def train(cfg: TrainConfig) -> None:
     ])
 
     # Store initial dict for drift measurement
-    dict_init_snapshot = model.latent.dictionary.get_atoms().clone()
+    dict_init_snapshot = model.get_dict_atoms().clone()
 
     # LR schedule: constant through P1-P3, cosine decay in P4
     def get_lr(epoch: int) -> float:
@@ -365,10 +369,19 @@ def train(cfg: TrainConfig) -> None:
             active_mask = (delta != 0)
             k_mean = k_all.mean().item()
             k_active = k_all[active_mask].mean().item() if active_mask.any() else 0.0
-            n_active = active_mask.float().sum(-1).mean().item()
+            # Moyenne d'atomes actifs SIMULTANÉMENT (par trame temporelle)
+            # Somme sur la dimension des atomes (dim=1), moyenne sur le Batch et le Temps
+            n_active_per_frame = active_mask.float().sum(dim=1).mean().item()
+            
+            # Nombre d'atomes distincts utilisés AU MOINS UNE FOIS dans tout le fichier audio
+            if active_mask.dim() == 3:
+                n_active_total = active_mask.any(dim=2).float().sum(dim=1).mean().item()
+            else:
+                n_active_total = n_active_per_frame
+
             sparsity = (delta == 0).float().mean().item()
             # Dictionary drift from initialization
-            current_atoms = model.latent.dictionary.get_atoms()
+            current_atoms = model.get_dict_atoms()
             dict_drift = 1.0 - F.cosine_similarity(
                 current_atoms.flatten().unsqueeze(0),
                 dict_init_snapshot.flatten().unsqueeze(0),
@@ -379,7 +392,7 @@ def train(cfg: TrainConfig) -> None:
                 f"recon {avg['recon']:.4f} | kl_γ {avg['kl_gamma']:.4f} | "
                 f"kl_δ {avg['kl_delta']:.4f} | "
                 f"k̄={k_mean:.3f}  k_act={k_active:.3f}  "
-                f"n_act={n_active:.1f}/{cfg.n_atoms}  "
+                f"n_act_frame={n_active_per_frame:.1f}  n_act_total={n_active_total:.1f}/{cfg.n_atoms}  "
                 f"δ₀={sparsity:.2%}  "
                 f"β={eff_beta_gamma:.4f}  τ={temp:.3f}  "
                 f"Δdict={dict_drift:.4f}"

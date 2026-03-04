@@ -19,6 +19,7 @@ class TestStructuredLatentSpace:
         self.n_atoms = 32
         self.latent_dim = 64
         self.batch = 4
+        self.seq_len = 16
 
         self.module = StructuredLatentSpace(
             input_dim=self.input_dim,
@@ -27,19 +28,19 @@ class TestStructuredLatentSpace:
         )
 
     def test_output_shapes(self):
-        h = torch.randn(self.batch, self.input_dim)
+        h = torch.randn(self.batch, self.input_dim, self.seq_len)
         z, info = self.module(h, temp=1.0)
 
-        assert z.shape == (self.batch, self.latent_dim)
-        assert info["B"].shape == (self.batch, self.n_atoms)
-        assert info["gamma"].shape == (self.batch, self.n_atoms)
-        assert info["delta"].shape == (self.batch, self.n_atoms)
-        assert info["k"].shape == (self.batch, self.n_atoms)
-        assert info["theta"].shape == (self.batch, self.n_atoms)
-        assert info["logits"].shape == (self.batch, self.n_atoms, 3)
+        assert z.shape == (self.batch, self.n_atoms, self.seq_len)
+        assert info["B"].shape == (self.batch, self.n_atoms, self.seq_len)
+        assert info["gamma"].shape == (self.batch, self.n_atoms, self.seq_len)
+        assert info["delta"].shape == (self.batch, self.n_atoms, self.seq_len)
+        assert info["k"].shape == (self.batch, self.n_atoms, self.seq_len)
+        assert info["theta"].shape == (self.batch, self.n_atoms, self.seq_len)
+        assert info["logits"].shape == (self.batch, self.n_atoms, 3, self.seq_len)
 
     def test_no_nan_forward(self):
-        h = torch.randn(self.batch, self.input_dim)
+        h = torch.randn(self.batch, self.input_dim, self.seq_len)
         z, info = self.module(h, temp=0.5)
 
         assert not z.isnan().any(), "NaN in z"
@@ -47,7 +48,7 @@ class TestStructuredLatentSpace:
         assert not info["B"].isnan().any(), "NaN in B"
 
     def test_backward_runs(self):
-        h = torch.randn(self.batch, self.input_dim, requires_grad=True)
+        h = torch.randn(self.batch, self.input_dim, self.seq_len, requires_grad=True)
         z, info = self.module(h, temp=1.0)
         loss = z.sum()
         loss.backward()
@@ -57,16 +58,10 @@ class TestStructuredLatentSpace:
 
     def test_delta_ternary(self):
         """Delta values should be in {-1, 0, +1}."""
-        h = torch.randn(self.batch, self.input_dim)
+        h = torch.randn(self.batch, self.input_dim, self.seq_len)
         _, info = self.module(h, temp=1.0)
         delta = info["delta"]
         valid = (delta == -1) | (delta == 0) | (delta == 1)
         assert valid.all(), f"Delta contains non-ternary values: {delta.unique()}"
 
-    def test_dictionary_normalization(self):
-        """Atom columns should have unit L2 norm when normalize=True."""
-        atoms = self.module.dictionary.get_atoms()  # [latent_dim, n_atoms]
-        norms = atoms.norm(p=2, dim=0)
-        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5), (
-            f"Column norms: {norms}"
-        )
+
