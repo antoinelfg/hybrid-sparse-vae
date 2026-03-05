@@ -166,11 +166,13 @@ class ConvUnrolledISTAEncoder(nn.Module):
         n_iterations: int = 3,
         kernel_size: int = 16,
         structure_mode: str = "ternary",
+        k_max: float = float("inf"),   # Clamp Gamma shape to keep sparse regime
     ):
         super().__init__()
         self.n_iterations = n_iterations
         self.n_atoms = n_atoms
         self.n_classes = 3 if structure_mode == "ternary" else 2
+        self.k_max = k_max
 
         # W_x: initial projection (preserves time with stride=kernel_size)
         self.W_x = nn.Conv1d(
@@ -209,6 +211,8 @@ class ConvUnrolledISTAEncoder(nn.Module):
 
         # 3. Project to distribution parameters
         k_out = F.softplus(self.head_k(h)) + 1e-4        # [B, n_atoms, T']
+        if self.k_max < float("inf"):
+            k_out = torch.clamp(k_out, max=self.k_max)   # Force sparse Gamma regime
         theta_out = F.softplus(self.head_theta(h)) + 1e-4  # [B, n_atoms, T']
 
         # 4. Logits: [B, n_atoms * n_classes, T'] → [B, n_atoms, T', n_classes]

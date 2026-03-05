@@ -186,9 +186,11 @@ class HybridSparseVAE(nn.Module):
         dict_init: str = "dct",
         normalize_dict: bool = True,
         k_min: float = 0.1,
+        k_max: float = float("inf"),
         magnitude_dist: str = "gamma",
         structure_mode: str = "ternary",
         motif_width: int = 16, # Added for convnmf
+        decoder_stride: int = 16,  # ConvTranspose1d stride for ShiftInvariantDecoder
     ):
         super().__init__()
         
@@ -211,6 +213,7 @@ class HybridSparseVAE(nn.Module):
                 n_iterations=3,
                 kernel_size=motif_width,
                 structure_mode=structure_mode,
+                k_max=k_max,
             )
         else:
             self.encoder = Encoder1D(
@@ -228,6 +231,7 @@ class HybridSparseVAE(nn.Module):
             dict_init=dict_init,
             normalize_dict=normalize_dict,
             k_min=k_min,
+            k_max=k_max,
             magnitude_dist=magnitude_dist,
             structure_mode=structure_mode,
             temporal_mode=self.temporal_mode,
@@ -254,6 +258,7 @@ class HybridSparseVAE(nn.Module):
                 n_freq_bins=input_channels,
                 motif_width=motif_width,
                 output_length=input_length,
+                stride=decoder_stride,
             )
         else:
             self.decoder = Decoder1D(

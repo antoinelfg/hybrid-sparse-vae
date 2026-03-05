@@ -20,7 +20,10 @@ build/
 *.png
 
 # Data (regenerated at runtime)
-data/
+!data/
+data/**
+!data/datasets.py
+!data/wsj0_dataset.py
 
 # Results (too large for git)
 results/

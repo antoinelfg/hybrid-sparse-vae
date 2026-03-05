@@ -39,12 +39,16 @@ def main():
     parser.add_argument("--n-atoms", type=int, default=64)
     parser.add_argument("--latent-dim", type=int, default=32)
     parser.add_argument("--encoder-output-dim", type=int, default=256)
-    parser.add_argument("--encoder-type", type=str, default="mlp")
-    parser.add_argument("--decoder-type", type=str, default="linear")
+    parser.add_argument("--encoder-type", type=str, default="resnet")
+    parser.add_argument("--decoder-type", type=str, default="convnmf")
     parser.add_argument("--dict-init", type=str, default="random")
     parser.add_argument("--magnitude-dist", type=str, default="gamma")
     parser.add_argument("--structure-mode", type=str, default="ternary")
     parser.add_argument("--disable-spectrogram-enhancements", action="store_false", dest="spectrogram_enhancements", help="Disable non-negativity and instance bounds.")
+    parser.add_argument("--denoise", action="store_true", default=False, help="Apply Wiener-style spectral denoising.")
+    parser.add_argument("--motif-width", type=int, default=16)
+    parser.add_argument("--decoder-stride", type=int, default=16)
+    parser.add_argument("--k-max", type=float, default=1e9)
 
     args, _ = parser.parse_known_args()
     args.dataset = 'fsdd'
@@ -52,6 +56,8 @@ def main():
     # Safety check for build_model requirements
     if not hasattr(args, 'encoder_output_dim'): args.encoder_output_dim = 256
     if not hasattr(args, 'dict_init'): args.dict_init = 'random'
+    args.input_channels = args.n_fft // 2 + 1
+    args.input_length = args.max_frames
     
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     out_path = Path(args.output_dir)
@@ -68,9 +74,10 @@ def main():
     print("Loading FSDD samples...")
     # Note: Dataset returns normalized magnitude spectrograms
     ds = get_fsdd_dataset(n_fft=args.n_fft, hop_length=args.hop_length, max_frames=args.max_frames,
-                          use_instance_norm=args.spectrogram_enhancements)
+                          use_instance_norm=args.spectrogram_enhancements,
+                          denoise=args.denoise)
     loader = DataLoader(ds, batch_size=args.n_samples, shuffle=True)
-    batch_x, = next(iter(loader))
+    batch_x, _ = next(iter(loader))
     batch_x = batch_x.to(device)
 
     # 3. Forward Pass

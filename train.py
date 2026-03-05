@@ -36,11 +36,20 @@ log = logging.getLogger(__name__)
 @dataclass
 class TrainConfig:
     # Data
-    dataset: str = "sinusoid"           # "sinusoid", "mnist", "audio"
+    dataset: str = "sinusoid"           # "sinusoid", "mnist", "audio", "fsdd", "librimix"
     data_dir: str = "./data"
     input_channels: int = 1
     input_length: int = 128
+    max_frames: int = 64                # Temporal dimension for spectrograms
     batch_size: int = 64
+    librimix_split: str = "train-100"
+    librimix_mix_type: str = "min"
+    librimix_mixture_dirname: str = "mix_clean"
+    librimix_sample_rate: int = 8000
+    librimix_n_fft: int = 512
+    librimix_hop_length: int = 128
+    librimix_win_length: int = 512
+    librimix_root_dir: str = ""         # Optional explicit root. If empty: {data_dir}/Libri2Mix
 
     # Architecture
     n_atoms: int = 128                  # overcomplete: 2x latent_dim
@@ -51,6 +60,9 @@ class TrainConfig:
     dict_init: str = "random"
     normalize_dict: bool = True
     k_min: float = 0.1
+    k_max: float = 1e9                   # Optional Gamma shape ceiling (1e9 = unconstrained)
+    motif_width: int = 16                # ConvNMF atom width (use 64 for Overlap-Add)
+    decoder_stride: int = -1             # ConvNMF stride (-1 = auto: max_frames // 4)
 
     # Dictionary learning
     freeze_dict_until: int = 0          # freeze dict weights until this epoch (0=always learn)
@@ -65,6 +77,11 @@ class TrainConfig:
     magnitude_dist: str = "gamma"       # "gamma" or "gaussian"
     structure_mode: str = "ternary"     # "ternary" or "binary"
     spectrogram_enhancements: bool = True # Force non-negativity, instance norm, higher sparsity for spectrograms
+    denoise: bool = False                  # Wiener-style spectral floor subtraction before log
+    masked_recon: bool = False             # Use masked MSE (signal-only loss) — pair with denoise=True
+    lambda_silence: float = 0.05          # Silence suppression weight (initial / P1-P2)
+    lambda_silence_final: float = 0.05    # Silence suppression weight at end of P4 (progressive pruning)
+    lambda_recon_l1: float = 0.0          # L1 noise-floor penalty on x_recon (drives output toward 0)
 
     # WandB
     use_wandb: bool = False
@@ -182,6 +199,9 @@ def train(cfg: TrainConfig) -> None:
     # ---- Data ----------------------------------------------------------
     dataset_name = cfg.dataset.lower()
     
+    dataset = None
+    loader = None
+
     if dataset_name == "sinusoid":
         dataset = make_toy_data(
             n_samples=2000,
@@ -210,16 +230,56 @@ def train(cfg: TrainConfig) -> None:
         # to match input_channels=1, input_length=8256
         dataset = get_fsdd_dataset(
             data_dir=f"{cfg.data_dir}/fsdd",
-            use_instance_norm=cfg.spectrogram_enhancements
+            use_instance_norm=cfg.spectrogram_enhancements,
+            denoise=cfg.denoise,
+        )
+    elif dataset_name == "librimix":
+        from data.datasets import get_librimix_dataset, get_librimix_dataloader
+
+        librimix_root = (
+            cfg.librimix_root_dir if cfg.librimix_root_dir else f"{cfg.data_dir}/Libri2Mix"
+        )
+        dataset = get_librimix_dataset(
+            root_dir=librimix_root,
+            split=cfg.librimix_split,
+            sample_rate=cfg.librimix_sample_rate,
+            mix_type=cfg.librimix_mix_type,
+            mixture_dirname=cfg.librimix_mixture_dirname,
+            n_fft=cfg.librimix_n_fft,
+            hop_length=cfg.librimix_hop_length,
+            win_length=cfg.librimix_win_length,
+            max_frames=cfg.max_frames,
+        )
+        loader = get_librimix_dataloader(
+            root_dir=librimix_root,
+            split=cfg.librimix_split,
+            sample_rate=cfg.librimix_sample_rate,
+            mix_type=cfg.librimix_mix_type,
+            mixture_dirname=cfg.librimix_mixture_dirname,
+            n_fft=cfg.librimix_n_fft,
+            hop_length=cfg.librimix_hop_length,
+            win_length=cfg.librimix_win_length,
+            max_frames=cfg.max_frames,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=False,
         )
     else:
         raise ValueError(f"Unknown dataset: {cfg.dataset}")
-        
-    loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True)
+
+    if loader is None:
+        loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True)
 
     # ---- Auto-detect shape to avoid magic constants --------------------
     if len(dataset) > 0:
-        sample_x = dataset[0][0]  # TensorDataset returns tuples
+        sample = dataset[0]
+        if isinstance(sample, dict):
+            sample_x = sample["mixture_mag"]
+        elif isinstance(sample, (tuple, list)):
+            sample_x = sample[0]
+        else:
+            sample_x = sample
         if sample_x.dim() == 2:
             cfg.input_channels = sample_x.shape[0]
             cfg.input_length = sample_x.shape[1]
@@ -238,8 +298,11 @@ def train(cfg: TrainConfig) -> None:
         dict_init=cfg.dict_init,
         normalize_dict=cfg.normalize_dict,
         k_min=cfg.k_min,
+        k_max=cfg.k_max,
         magnitude_dist=cfg.magnitude_dist,
         structure_mode=cfg.structure_mode,
+        motif_width=cfg.motif_width,
+        decoder_stride=cfg.decoder_stride if cfg.decoder_stride > 0 else cfg.input_length // 4,
     ).to(device)
 
     # Separate param groups: dict learns slower
@@ -303,6 +366,13 @@ def train(cfg: TrainConfig) -> None:
         eff_beta_gamma = beta_frac * cfg.beta_gamma_final
         eff_beta_delta = beta_frac * cfg.beta_delta_final
 
+        # Progressive lambda_silence: ramps from lambda_silence → lambda_silence_final
+        # over the same schedule as beta (Phase 3 ramp + Phase 4 plateau).
+        # P1/P2: beta_frac=0 → use initial value; P4: beta_frac=1 → use final value.
+        eff_lambda_silence = (
+            cfg.lambda_silence + beta_frac * (cfg.lambda_silence_final - cfg.lambda_silence)
+        )
+
         # Phase label for logging
         if epoch <= cfg.phase1_end:
             phase_label = "P1:soft"
@@ -319,7 +389,10 @@ def train(cfg: TrainConfig) -> None:
         }
 
         for batch in loader:
-            batch_x = batch[0]
+            if isinstance(batch, dict):
+                batch_x = batch["mixture_mag"]
+            else:
+                batch_x = batch[0]
             batch_x = batch_x.to(device)
             optimizer.zero_grad()
 
@@ -346,6 +419,9 @@ def train(cfg: TrainConfig) -> None:
                 beta_gamma=eff_beta_gamma,
                 beta_delta=eff_beta_delta,
                 magnitude_dist=cfg.magnitude_dist,
+                masked_recon=cfg.masked_recon,
+                lambda_silence=eff_lambda_silence,
+                lambda_recon_l1=cfg.lambda_recon_l1,
             )
 
             loss.backward()
@@ -408,7 +484,7 @@ def train(cfg: TrainConfig) -> None:
                     "kl_delta": avg["kl_delta"],
                     "k_mean": k_mean,
                     "k_active": k_active,
-                    "n_active": n_active,
+                    "n_active": n_active_total,
                     "sparsity": sparsity,
                     "dict_drift": dict_drift,
                     "phase_beta_gamma": eff_beta_gamma,

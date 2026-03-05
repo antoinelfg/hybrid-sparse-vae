@@ -126,6 +126,9 @@ def compute_hybrid_loss(
     beta_gamma: float = 1.0,
     beta_delta: float = 1.0,
     magnitude_dist: str = "gamma",
+    masked_recon: bool = False,
+    lambda_silence: float = 0.1,
+    lambda_recon_l1: float = 0.0,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Full ELBO = Reconstruction + β_γ · KL_Gamma + β_δ · KL_Categorical.
 
@@ -144,6 +147,15 @@ def compute_hybrid_loss(
         Prior for ternary Categorical ([0.05, 0.90, 0.05] by default).
     beta_gamma, beta_delta : float
         KL weighting coefficients (β-VAE style).
+    masked_recon : bool
+        If True, use masked reconstruction loss separating signal from silence:
+          - Signal loss:  MSE averaged only over non-zero bins (M=1)
+          - Silence loss: λ_silence × MSE averaged only over zero bins (M=0)
+        This prevents the model from ignoring sparse peaks by averaging over
+        a sea of zeros. Recommended when using spectral denoising (>80% zeros).
+    lambda_silence : float
+        Weight of the silence suppression term (default 0.1).
+        Keeps x_recon near zero where x is zero, preventing hallucinations.
 
     Returns
     -------
@@ -152,9 +164,32 @@ def compute_hybrid_loss(
     components : dict
         ``{"recon", "kl_gamma", "kl_delta"}`` for logging.
     """
-    # 1. Reconstruction loss (sum over all dims, mean over batch)
+    # 1. Reconstruction loss
     batch_size = x.size(0)
-    recon_loss = F.mse_loss(x_recon, x, reduction="sum") / batch_size
+
+    if masked_recon:
+        # Binary mask: 1 where signal is present, 0 where silence
+        M = (x > 0).float()
+
+        err = (x_recon - x).pow(2)
+
+        # Normalise by batch_size (same as KL terms) so the signal loss is
+        # commensurable with kl_γ and kl_δ regardless of signal density.
+        # Dividing by n_signal (pixel-average) gave O(0.01) signal_loss vs
+        # O(1-10) KL, causing posterior collapse (all-δ=0 local minimum).
+        signal_loss  = (err * M).sum() / batch_size
+        silence_loss = (x_recon.pow(2) * (1.0 - M)).sum() / batch_size
+
+        recon_loss = signal_loss + lambda_silence * silence_loss
+    else:
+        recon_loss = F.mse_loss(x_recon, x, reduction="sum") / batch_size
+
+    # Optional L1 noise-floor penalty: pulls ALL output pixels toward 0.
+    # Acts like spectral pruning — forces decoder to earn every non-zero pixel.
+    # Works in concert with masked_recon: signal_loss pulls peaks up,
+    # lambda_recon_l1 pulls everything down, silence_loss penalises hallucinations.
+    if lambda_recon_l1 > 0.0:
+        recon_loss = recon_loss + lambda_recon_l1 * x_recon.abs().sum() / batch_size
 
     # 2. KL Magnitude (Gamma or Gaussian)
     if magnitude_dist == "gamma":
@@ -174,3 +209,4 @@ def compute_hybrid_loss(
         "kl_gamma": kl_g.detach(),
         "kl_delta": kl_d.detach(),
     }
+

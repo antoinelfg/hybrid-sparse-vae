@@ -82,6 +82,7 @@ class StructuredLatentSpace(nn.Module):
         dict_init: str = "dct",
         normalize_dict: bool = True,
         k_min: float = 0.1,
+        k_max: float = float("inf"),      # Optional Gamma shape ceiling
         magnitude_dist: str = "gamma",       # "gamma" or "gaussian"
         structure_mode: str = "ternary",     # "ternary" or "binary"
         temporal_mode: bool = True,          # True: ConvNMF, False: Dense NMF
@@ -90,6 +91,7 @@ class StructuredLatentSpace(nn.Module):
         self.n_atoms = n_atoms
         self.latent_dim = latent_dim
         self.k_min = k_min
+        self.k_max = k_max
 
         self.magnitude_dist = magnitude_dist
         self.structure_mode = structure_mode
@@ -151,7 +153,10 @@ class StructuredLatentSpace(nn.Module):
 
         # k and θ must be > 0
         k = F.softplus(raw_k) + self.k_min
-        k = torch.clamp(k, max=1000.0)
+        if self.k_max < 1000.0:  # custom ceiling
+            k = torch.clamp(k, max=self.k_max)
+        else:
+            k = torch.clamp(k, max=1000.0)
         
         theta = F.softplus(raw_theta) + 1e-6
         theta = torch.clamp(theta, min=1e-4, max=100.0)
