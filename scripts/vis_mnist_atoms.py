@@ -60,6 +60,8 @@ def load_state_dict(path: Path, device: torch.device) -> dict[str, torch.Tensor]
 
     if isinstance(payload, dict) and "state_dict" in payload:
         state_dict = payload["state_dict"]
+    elif isinstance(payload, dict) and "model_state" in payload:
+        state_dict = payload["model_state"]
     elif isinstance(payload, dict):
         state_dict = payload
     else:
@@ -298,7 +300,7 @@ def main():
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
     cbar = fig.colorbar(sm, cax=ax_cbar)
-    cbar.set_label('Activation Probability $\mathbb{E}[|\delta|]$', fontsize=20, labelpad=15)
+    cbar.set_label(r'Activation Probability $\mathbb{E}[|\delta|]$', fontsize=20, labelpad=15)
     cbar.ax.tick_params(labelsize=14)
     cbar.outline.set_edgecolor(text_color)
     

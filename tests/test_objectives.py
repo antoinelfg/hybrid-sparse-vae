@@ -12,7 +12,12 @@ import pytest
 import torch
 import torch.distributions as dist
 
-from utils.objectives import kl_gamma, kl_categorical, compute_hybrid_loss
+from utils.objectives import (
+    kl_gamma,
+    kl_categorical,
+    compute_fully_polar_loss,
+    compute_hybrid_loss,
+)
 
 
 class TestKLGamma:
@@ -91,3 +96,84 @@ class TestKLCategorical:
         logits = torch.log(prior).unsqueeze(0).expand(10, -1)
         kl = kl_categorical(logits, prior)
         assert kl.item() < 1e-4, f"KL should be ~0, got {kl.item()}"
+
+
+class TestHybridLossNormalization:
+    def test_site_normalization_scales_latent_kl_by_num_sites(self):
+        x = torch.zeros(2, 1, 4)
+        x_recon = torch.zeros_like(x)
+        params = {
+            "k": torch.full((2, 3), 0.7),
+            "theta": torch.full((2, 3), 1.2),
+            "logits": torch.zeros(2, 3, 3),
+        }
+
+        _, batch_components = compute_hybrid_loss(
+            x=x,
+            x_recon=x_recon,
+            params=params,
+            k_0=0.3,
+            theta_0=1.0,
+            beta_gamma=1.0,
+            beta_delta=1.0,
+            kl_normalization="batch",
+        )
+        _, site_components = compute_hybrid_loss(
+            x=x,
+            x_recon=x_recon,
+            params=params,
+            k_0=0.3,
+            theta_0=1.0,
+            beta_gamma=1.0,
+            beta_delta=1.0,
+            kl_normalization="site",
+        )
+
+        num_sites = params["k"].numel() / x.size(0)
+        assert torch.allclose(
+            batch_components["kl_gamma"] / num_sites,
+            site_components["kl_gamma"],
+            atol=1e-6,
+        )
+        assert torch.allclose(
+            batch_components["kl_delta"] / num_sites,
+            site_components["kl_delta"],
+            atol=1e-6,
+        )
+
+
+class TestFullyPolarLoss:
+    def test_reports_three_kl_terms(self):
+        x = torch.zeros(2, 1, 4)
+        x_recon = torch.zeros_like(x)
+        params = {
+            "k": torch.full((2, 3), 0.7),
+            "theta": torch.full((2, 3), 1.2),
+            "presence_logits": torch.zeros(2, 3, 2),
+            "sign_logits": torch.zeros(2, 3, 2),
+        }
+
+        _, components = compute_fully_polar_loss(
+            x=x,
+            x_recon=x_recon,
+            params=params,
+            k_0=0.3,
+            theta_0=1.0,
+            presence_prior_probs=torch.tensor([0.9, 0.1]),
+            sign_prior_probs=torch.tensor([0.5, 0.5]),
+            beta_gamma=1.0,
+            beta_presence=0.1,
+            beta_sign=0.02,
+            kl_normalization="batch",
+        )
+
+        assert "kl_gamma" in components
+        assert "kl_presence" in components
+        assert "kl_sign" in components
+        assert "weighted_kl_presence" in components
+        assert "weighted_kl_sign" in components
+        assert torch.allclose(
+            components["kl_delta"],
+            components["kl_presence"] + components["kl_sign"],
+            atol=1e-6,
+        )

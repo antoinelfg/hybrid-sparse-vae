@@ -12,10 +12,13 @@ Baselines:
 
 from __future__ import annotations
 
+import argparse
+import json
 import logging
 import math
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -305,12 +308,30 @@ def train_baseline(
 #  Main comparison
 # ===========================================================================
 
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run toy sinusoid baseline comparisons")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--n-samples", type=int, default=2000)
+    parser.add_argument("--length", type=int, default=128)
+    parser.add_argument("--n-components", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=2000)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--output-json", type=Path, default=None)
+    return parser
+
+
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    args = build_arg_parser().parse_args()
+    device = args.device if torch.cuda.is_available() else "cpu"
     log.info(f"Device: {device}")
 
     # Generate data
-    data = make_toy_data(n_samples=2000, length=128, n_components=3, seed=0)
+    data = make_toy_data(
+        n_samples=args.n_samples,
+        length=args.length,
+        n_components=args.n_components,
+        seed=args.seed,
+    )
     X = data.tensors[0]
     log.info(f"Data: {X.shape}, range [{X.min():.3f}, {X.max():.3f}]")
 
@@ -323,20 +344,20 @@ def main():
     # --- Baseline 1: Vanilla AE ---
     log.info("\n=== Vanilla AE ===")
     ae = VanillaAE(latent_dim=128)
-    results["vanilla_ae"] = train_baseline(ae, data, "ae", epochs=2000, device=device)
+    results["vanilla_ae"] = train_baseline(ae, data, "ae", epochs=args.epochs, device=device)
 
     # --- Baseline 2: Vanilla VAE ---
     log.info("\n=== Vanilla VAE (β=0.005) ===")
     vae = VanillaVAE(latent_dim=128)
     results["vanilla_vae"] = train_baseline(
-        vae, data, "vae", epochs=2000, beta=0.005, device=device
+        vae, data, "vae", epochs=args.epochs, beta=0.005, device=device
     )
 
     # --- Baseline 3: Sparse AE (L1) ---
     log.info("\n=== Sparse AE (λ=0.01) ===")
     sae = SparseAE(latent_dim=128)
     results["sparse_ae"] = train_baseline(
-        sae, data, "sparse_ae", epochs=2000, lambda_l1=0.01, device=device
+        sae, data, "sparse_ae", epochs=args.epochs, lambda_l1=0.01, device=device
     )
 
     # --- Baseline 4: OMP (oracle, no learning) ---
@@ -385,6 +406,23 @@ def main():
     log.info("NOTE: Compare Hybrid Sparse VAE best recon (~3.9) against these.")
     log.info("      Our model adds: structured sparsity, generative sampling,")
     log.info("      interpretable polar decomposition (sign × magnitude × dictionary).")
+
+    if args.output_json is not None:
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        with args.output_json.open("w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "seed": args.seed,
+                    "n_samples": args.n_samples,
+                    "length": args.length,
+                    "n_components": args.n_components,
+                    "epochs": args.epochs,
+                    "results": results,
+                },
+                handle,
+                indent=2,
+                sort_keys=True,
+            )
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ checkpoints/
 *.egg-info/
 dist/
 build/
-
+wandb/
 # SLURM & runtime outputs (keep in results/ but don't track)
 *.log
 *.out
@@ -18,6 +18,9 @@ build/
 
 # Generated images
 *.png
+*.wav
+*.sh
+*.json
 
 # Data (regenerated at runtime)
 !data/

@@ -32,38 +32,80 @@ from utils.separation import wiener_separation
 
 
 def extract_final_train_metrics(train_log: Path) -> dict[str, float]:
-    """Extract final epoch metrics from train.log if available."""
+    """Extract final epoch metrics from train.log if available.
+
+    Supports the current logging format:
+      k̄=... k_act=... n_act_frame=... n_act_total=.../N δ₀=...% β=... τ=... Δdict=...
+    """
     if not train_log.exists():
         return {}
 
-    pattern = re.compile(
-        r"Epoch\s+(\d+).*?"
-        r"recon\s+([\d.]+).*?"
-        r"kl_γ\s+([\d.]+).*?"
-        r"kl_δ\s+([\d.]+).*?"
-        r"k̄=([\d.]+).*?"
-        r"n_act=([\d.]+).*?"
-        r"δ₀=([\d.]+)%.*?"
-        r"Δdict=([\d.]+)"
-    )
+    def _extract(pattern: str, text: str) -> float | None:
+        m = re.search(pattern, text)
+        if not m:
+            return None
+        return float(m.group(1))
 
-    last: dict[str, float] = {}
     with train_log.open("r", encoding="utf-8") as f:
-        for line in f:
-            m = pattern.search(line)
-            if not m:
-                continue
-            last = {
-                "epoch": float(m.group(1)),
-                "recon": float(m.group(2)),
-                "kl_gamma": float(m.group(3)),
-                "kl_delta": float(m.group(4)),
-                "k_mean": float(m.group(5)),
-                "n_active": float(m.group(6)),
-                "sparsity": float(m.group(7)) / 100.0,
-                "dict_drift": float(m.group(8)),
-            }
-    return last
+        lines = f.readlines()
+
+    last_epoch_line = ""
+    for line in reversed(lines):
+        if "[INFO] - Epoch" in line:
+            last_epoch_line = line
+            break
+
+    if not last_epoch_line:
+        return {}
+
+    metrics: dict[str, float] = {}
+
+    epoch = _extract(r"Epoch\s+(\d+)", last_epoch_line)
+    recon = _extract(r"recon\s+([0-9.]+)", last_epoch_line)
+    kl_gamma = _extract(r"kl_γ\s+([0-9.]+)", last_epoch_line)
+    kl_delta = _extract(r"kl_δ\s+([0-9.]+)", last_epoch_line)
+    k_bar = _extract(r"k̄=([0-9.]+)", last_epoch_line)
+    k_act = _extract(r"k_act=([0-9.]+)", last_epoch_line)
+    n_act_frame = _extract(r"n_act_frame=([0-9.]+)", last_epoch_line)
+    n_act_total = _extract(r"n_act_total=([0-9.]+)", last_epoch_line)
+    delta_0_pct = _extract(r"δ₀=([0-9.]+)%", last_epoch_line)
+    beta = _extract(r"β=([0-9.]+)", last_epoch_line)
+    temp = _extract(r"τ=([0-9.]+)", last_epoch_line)
+    dict_drift = _extract(r"Δdict=([0-9.]+)", last_epoch_line)
+
+    if epoch is not None:
+        metrics["epoch"] = epoch
+    if recon is not None:
+        metrics["recon"] = recon
+    if kl_gamma is not None:
+        metrics["kl_gamma"] = kl_gamma
+    if kl_delta is not None:
+        metrics["kl_delta"] = kl_delta
+    if k_bar is not None:
+        metrics["k_mean"] = k_bar
+        metrics["k_bar_final"] = k_bar
+    if k_act is not None:
+        metrics["k_active"] = k_act
+        metrics["k_act_final"] = k_act
+    if n_act_frame is not None:
+        metrics["n_active_frame"] = n_act_frame
+        metrics["n_act_frame_final"] = n_act_frame
+    if n_act_total is not None:
+        metrics["n_active_total"] = n_act_total
+        metrics["n_active"] = n_act_total  # Backward-compatible key
+        metrics["n_act_total_final"] = n_act_total
+    if delta_0_pct is not None:
+        metrics["sparsity"] = delta_0_pct / 100.0
+        metrics["delta_0_final"] = delta_0_pct
+    if beta is not None:
+        metrics["beta"] = beta
+        metrics["beta_final"] = beta
+    if temp is not None:
+        metrics["temp"] = temp
+    if dict_drift is not None:
+        metrics["dict_drift"] = dict_drift
+
+    return metrics
 
 
 def load_hydra_config_from_model_dir(model_dir: Path) -> dict[str, Any]:
@@ -90,6 +132,8 @@ def load_state_dict(path: Path, device: torch.device) -> dict[str, torch.Tensor]
 
     if isinstance(payload, dict) and "state_dict" in payload:
         state_dict = payload["state_dict"]
+    elif isinstance(payload, dict) and "model_state" in payload:
+        state_dict = payload["model_state"]
     elif isinstance(payload, dict):
         state_dict = payload
     else:
@@ -100,16 +144,45 @@ def load_state_dict(path: Path, device: torch.device) -> dict[str, torch.Tensor]
     return state_dict
 
 
-def build_model_from_config(cfg: dict[str, Any], args: argparse.Namespace) -> HybridSparseVAE:
+def infer_arch_from_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, int]:
+    """Infer critical architecture dims directly from checkpoint tensors."""
+    out: dict[str, int] = {}
+
+    dec_w = state_dict.get("decoder.weight")
+    if torch.is_tensor(dec_w) and dec_w.dim() == 3:
+        # ConvNMF decoder weight: [n_atoms, freq_bins, motif_width]
+        out["n_atoms"] = int(dec_w.shape[0])
+        out["input_channels"] = int(dec_w.shape[1])
+        out["motif_width"] = int(dec_w.shape[2])
+
+    return out
+
+
+def build_model_from_config(
+    cfg: dict[str, Any],
+    args: argparse.Namespace,
+    state_dict: dict[str, torch.Tensor] | None = None,
+) -> HybridSparseVAE:
     """Instantiate model without mutating architecture code."""
-    input_channels = int(cfg.get("input_channels", args.input_channels))
-    input_length = int(cfg.get("input_length", args.input_length))
+    inferred = infer_arch_from_state_dict(state_dict or {})
+
+    input_channels = int(inferred.get("input_channels", cfg.get("input_channels", args.input_channels)))
+    input_length_cfg = int(cfg.get("input_length", args.input_length))
+    max_frames_cfg = cfg.get("max_frames")
+    if isinstance(max_frames_cfg, int) and max_frames_cfg > 0:
+        # Hydra config can keep stale input_length while actual training used max_frames.
+        input_length = int(max_frames_cfg)
+    else:
+        input_length = input_length_cfg
+    n_atoms = int(inferred.get("n_atoms", cfg.get("n_atoms", args.n_atoms)))
+    motif_width = int(inferred.get("motif_width", cfg.get("motif_width", args.motif_width)))
+
     return HybridSparseVAE(
         input_channels=input_channels,
         input_length=input_length,
         encoder_type=cfg.get("encoder_type", args.encoder_type),
         encoder_output_dim=int(cfg.get("encoder_output_dim", args.encoder_output_dim)),
-        n_atoms=int(cfg.get("n_atoms", args.n_atoms)),
+        n_atoms=n_atoms,
         latent_dim=int(cfg.get("latent_dim", args.latent_dim)),
         decoder_type=cfg.get("decoder_type", args.decoder_type),
         dict_init=cfg.get("dict_init", args.dict_init),
@@ -118,8 +191,11 @@ def build_model_from_config(cfg: dict[str, Any], args: argparse.Namespace) -> Hy
         k_max=float(cfg.get("k_max", args.k_max)),
         magnitude_dist=cfg.get("magnitude_dist", args.magnitude_dist),
         structure_mode=cfg.get("structure_mode", args.structure_mode),
-        motif_width=int(cfg.get("motif_width", args.motif_width)),
+        motif_width=motif_width,
         decoder_stride=int(cfg.get("decoder_stride", args.decoder_stride)),
+        match_encoder_decoder_stride=bool(
+            cfg.get("match_encoder_decoder_stride", args.match_encoder_decoder_stride)
+        ),
     )
 
 
@@ -328,6 +404,7 @@ def main() -> None:
     parser.add_argument("--structure-mode", type=str, default="ternary")
     parser.add_argument("--motif-width", type=int, default=16)
     parser.add_argument("--decoder-stride", type=int, default=16)
+    parser.add_argument("--match-encoder-decoder-stride", action="store_true")
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir)
@@ -337,8 +414,9 @@ def main() -> None:
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     cfg = load_hydra_config_from_model_dir(model_dir)
-    model = build_model_from_config(cfg, args).to(device)
-    model.load_state_dict(load_state_dict(ckpt_path, device=device))
+    state_dict = load_state_dict(ckpt_path, device=device)
+    model = build_model_from_config(cfg, args, state_dict=state_dict).to(device)
+    model.load_state_dict(state_dict)
 
     loader = get_librimix_dataloader(
         root_dir=args.librimix_root,

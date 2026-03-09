@@ -8,8 +8,8 @@ Combines:
 Encoder/Decoder modes:
   * ``"linear"`` — symmetric MLP (recommended for toy experiments)
   * ``"resnet"`` — deep Conv1D (for real data)
-  * ``"lista"`` — Convolutional Unrolled ISTA (closes amortization gap,
-                  compatible with ``decoder_type="convnmf"`` only)
+  * ``"lista"`` — Unrolled ISTA inference encoder (convolutional in temporal
+                  mode, linear in dense mode)
 """
 
 from __future__ import annotations
@@ -19,7 +19,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from modules.layers import Encoder1D, Decoder1D, ConvUnrolledISTAEncoder
+from modules.layers import (
+    Encoder1D,
+    Decoder1D,
+    ConvUnrolledISTAEncoder,
+    LinearUnrolledISTAEncoder,
+    PolarLinearLISTAEncoder,
+    FullyPolarLinearLISTAEncoder,
+)
 from modules.latent_space import StructuredLatentSpace
 
 
@@ -191,14 +198,59 @@ class HybridSparseVAE(nn.Module):
         structure_mode: str = "ternary",
         motif_width: int = 16, # Added for convnmf
         decoder_stride: int = 16,  # ConvTranspose1d stride for ShiftInvariantDecoder
+        match_encoder_decoder_stride: bool = False,
+        lista_iterations: int = 5,
+        lista_threshold_init: float = 0.1,
+        delta_head_mode: str = "shared",
+        polar_encoder: bool = False,
+        fully_polar_encoder: bool = False,
+        shape_norm: str = "l2_global",
+        gain_feature: str = "log_l2",
+        gamma_scale_injection: str = "multiply_input_norm",
+        shape_detach_to_gamma: bool = True,
+        delta_factorization: str = "ternary_direct",
+        presence_estimator: str = "gumbel_binary",
+        sign_estimator: str = "gumbel_binary",
+        presence_alpha: float = 1.5,
+        tau_presence_eval: float = 0.5,
+        sign_tau_eval: float = 0.5,
+        presence_head_bias_init: float = 0.0,
+        sign_head_bias_init: float = 0.0,
+        gumbel_epsilon: float = 0.05,
     ):
         super().__init__()
         
         self.temporal_mode = (decoder_type == "convnmf")
+        self.match_encoder_decoder_stride = bool(match_encoder_decoder_stride)
         spatial_pooling = not self.temporal_mode
 
         # ---- Encoder ---------------------------------------------------
         self.lista_mode = (encoder_type == "lista")
+        self.polar_lista_mode = (encoder_type == "polar_lista") or bool(polar_encoder)
+        self.fully_polar_lista_mode = (encoder_type == "fully_polar_lista") or bool(fully_polar_encoder)
+        if self.polar_lista_mode and self.fully_polar_lista_mode:
+            raise ValueError("Choose exactly one of encoder_type='polar_lista' or 'fully_polar_lista'.")
+        if self.polar_lista_mode and encoder_type != "polar_lista":
+            raise ValueError("Set encoder_type='polar_lista' when polar_encoder=True.")
+        if self.fully_polar_lista_mode and encoder_type != "fully_polar_lista":
+            raise ValueError("Set encoder_type='fully_polar_lista' when fully_polar_encoder=True.")
+        if self.polar_lista_mode and self.temporal_mode:
+            raise ValueError("Polar LISTA is only implemented for non-temporal dense runs.")
+        if self.fully_polar_lista_mode and self.temporal_mode:
+            raise ValueError("Fully Polar LISTA is only implemented for non-temporal dense runs.")
+        if delta_factorization != "ternary_direct" and not self.polar_lista_mode:
+            if not self.fully_polar_lista_mode:
+                raise ValueError("delta_factorization='presence_sign' is only supported with polar LISTA encoders.")
+        if self.fully_polar_lista_mode and delta_factorization != "presence_sign":
+            raise ValueError("fully_polar_lista requires delta_factorization='presence_sign'.")
+        if self.fully_polar_lista_mode and gamma_scale_injection != "multiply_input_norm":
+            raise ValueError("fully_polar_lista currently only supports gamma_scale_injection='multiply_input_norm'.")
+        if self.fully_polar_lista_mode and sign_estimator != "gumbel_binary":
+            raise ValueError("fully_polar_lista currently supports sign_estimator='gumbel_binary' only.")
+        if self.fully_polar_lista_mode and self.temporal_mode:
+            raise ValueError("fully_polar_lista is not supported with decoder_type='convnmf'.")
+        if delta_factorization != "ternary_direct" and not self.polar_lista_mode and not self.fully_polar_lista_mode:
+            raise ValueError("delta_factorization='presence_sign' is only supported with encoder_type='polar_lista'.")
         if encoder_type == "linear":
             self.encoder = LinearEncoder1D(
                 input_channels=input_channels,
@@ -207,20 +259,67 @@ class HybridSparseVAE(nn.Module):
                 output_dim=encoder_output_dim,
             )
         elif encoder_type == "lista":
-            self.encoder = ConvUnrolledISTAEncoder(
+            if self.temporal_mode:
+                self.encoder = ConvUnrolledISTAEncoder(
+                    input_channels=input_channels,
+                    n_atoms=n_atoms,
+                    n_iterations=lista_iterations,
+                    kernel_size=motif_width,
+                    structure_mode=structure_mode,
+                    k_max=k_max,
+                    delta_head_mode=delta_head_mode,
+                )
+            else:
+                self.encoder = LinearUnrolledISTAEncoder(
+                    input_channels=input_channels,
+                    input_length=input_length,
+                    n_atoms=n_atoms,
+                    n_iterations=lista_iterations,
+                    structure_mode=structure_mode,
+                    k_max=k_max,
+                    threshold_init=lista_threshold_init,
+                    delta_head_mode=delta_head_mode,
+                )
+        elif self.polar_lista_mode:
+            self.encoder = PolarLinearLISTAEncoder(
                 input_channels=input_channels,
+                input_length=input_length,
                 n_atoms=n_atoms,
-                n_iterations=3,
-                kernel_size=motif_width,
-                structure_mode=structure_mode,
+                n_iterations=lista_iterations,
+                k_min=k_min,
                 k_max=k_max,
+                shape_norm=shape_norm,
+                gain_feature=gain_feature,
+                shape_detach_to_gamma=shape_detach_to_gamma,
+                presence_head_bias_init=presence_head_bias_init,
+                sign_head_bias_init=sign_head_bias_init,
+                threshold_init=lista_threshold_init,
+            )
+        elif self.fully_polar_lista_mode:
+            self.encoder = FullyPolarLinearLISTAEncoder(
+                input_channels=input_channels,
+                input_length=input_length,
+                n_atoms=n_atoms,
+                n_iterations=lista_iterations,
+                k_min=k_min,
+                k_max=k_max,
+                shape_detach_to_gamma=shape_detach_to_gamma,
+                presence_head_bias_init=presence_head_bias_init,
+                sign_head_bias_init=sign_head_bias_init,
+                threshold_init=lista_threshold_init,
             )
         else:
+            # Opt-in architecture-safe mode for ConvNMF runs. Legacy checkpoints
+            # keep the historical x16 encoder reduction unless this flag is set.
+            temporal_downsample_factor = None
+            if self.temporal_mode and self.match_encoder_decoder_stride:
+                temporal_downsample_factor = decoder_stride
             self.encoder = Encoder1D(
                 input_channels=input_channels,
                 hidden_channels=encoder_hidden,
                 output_dim=encoder_output_dim,
                 spatial_pooling=spatial_pooling,
+                temporal_downsample_factor=temporal_downsample_factor,
             )
 
         # ---- Structured Latent Space -----------------------------------
@@ -235,6 +334,12 @@ class HybridSparseVAE(nn.Module):
             magnitude_dist=magnitude_dist,
             structure_mode=structure_mode,
             temporal_mode=self.temporal_mode,
+            delta_factorization=delta_factorization,
+            presence_estimator=presence_estimator,
+            sign_estimator=sign_estimator,
+            presence_alpha=presence_alpha,
+            tau_presence_eval=tau_presence_eval,
+            gumbel_epsilon=gumbel_epsilon,
         )
 
         # ---- Decoder ---------------------------------------------------
@@ -278,7 +383,30 @@ class HybridSparseVAE(nn.Module):
         temp: float = 1.0,
         sampling: str = "stochastic",
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        if self.lista_mode:
+        if self.fully_polar_lista_mode:
+            k, theta_tilde, input_scale, presence_logits, sign_logits, aux = self.encoder(x)
+            z, info = self.latent.forward_from_fully_factorized_params(
+                k,
+                theta_tilde,
+                input_scale,
+                presence_logits,
+                sign_logits,
+                temp=temp,
+                sampling=sampling,
+            )
+            info.update(aux)
+        elif self.polar_lista_mode:
+            k, theta, presence_logits, sign_scores, aux = self.encoder(x)
+            z, info = self.latent.forward_from_factorized_params(
+                k,
+                theta,
+                presence_logits,
+                sign_scores,
+                temp=temp,
+                sampling=sampling,
+            )
+            info.update(aux)
+        elif self.lista_mode:
             # LISTA encoder returns (k, theta, logits) directly — skip conv_params head
             k, theta, logits = self.encoder(x)
             z, info = self.latent.forward_from_params(k, theta, logits, temp=temp, sampling=sampling)
@@ -296,4 +424,3 @@ class HybridSparseVAE(nn.Module):
             return self.decoder.weight.data
         else:
             return self.latent.dictionary.get_atoms()
-

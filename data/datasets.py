@@ -250,6 +250,7 @@ def get_librimix_dataset(
     win_length: int | None = None,
     center: bool = True,
     max_frames: int | None = None,
+    crop_mode: str = "center",
 ):
     """Return Libri2Mix dataset with mixture/source spectrogram triplets."""
     from data.librimix_dataset import LibriMixDataset
@@ -265,6 +266,7 @@ def get_librimix_dataset(
         win_length=win_length,
         center=center,
         max_frames=max_frames,
+        crop_mode=crop_mode,
     )
 
 
@@ -279,6 +281,7 @@ def get_librimix_dataloader(
     win_length: int | None = None,
     center: bool = True,
     max_frames: int | None = None,
+    crop_mode: str = "center",
     batch_size: int = 1,
     shuffle: bool = False,
     num_workers: int = 0,
@@ -298,6 +301,7 @@ def get_librimix_dataloader(
         win_length=win_length,
         center=center,
         max_frames=max_frames,
+        crop_mode=crop_mode,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,

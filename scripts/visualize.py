@@ -47,6 +47,9 @@ from utils.visualization import (
 
 def build_model(args) -> HybridSparseVAE:
     """Build model with configuration from args."""
+    decoder_stride = getattr(args, "decoder_stride", 16)
+    if decoder_stride is None or decoder_stride <= 0:
+        decoder_stride = max(int(getattr(args, "input_length", 16)) // 4, 1)
     return HybridSparseVAE(
         input_channels=getattr(args, "input_channels", 1),
         input_length=args.input_length,
@@ -60,7 +63,8 @@ def build_model(args) -> HybridSparseVAE:
         k_min=getattr(args, "k_min", 0.1),
         k_max=getattr(args, "k_max", 1e9),
         motif_width=getattr(args, "motif_width", 16),
-        decoder_stride=getattr(args, "decoder_stride", 16),
+        decoder_stride=decoder_stride,
+        match_encoder_decoder_stride=getattr(args, "match_encoder_decoder_stride", False),
         magnitude_dist=getattr(args, "magnitude_dist", "gamma"),
         structure_mode=getattr(args, "structure_mode", "ternary"),
     )
@@ -88,6 +92,7 @@ def main():
     parser.add_argument("--input-channels", type=int, default=1)
     parser.add_argument("--motif-width", type=int, default=16)
     parser.add_argument("--k-max", type=float, default=1e9)
+    parser.add_argument("--match-encoder-decoder-stride", action="store_true")
 
     # Data config
     parser.add_argument("--seed", type=int, default=42)

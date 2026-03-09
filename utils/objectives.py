@@ -129,6 +129,7 @@ def compute_hybrid_loss(
     masked_recon: bool = False,
     lambda_silence: float = 0.1,
     lambda_recon_l1: float = 0.0,
+    kl_normalization: str = "batch",
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Full ELBO = Reconstruction + β_γ · KL_Gamma + β_δ · KL_Categorical.
 
@@ -191,22 +192,144 @@ def compute_hybrid_loss(
     if lambda_recon_l1 > 0.0:
         recon_loss = recon_loss + lambda_recon_l1 * x_recon.abs().sum() / batch_size
 
+    if kl_normalization == "batch":
+        kl_norm = float(max(batch_size, 1))
+    elif kl_normalization == "site":
+        kl_norm = float(max(params["k"].numel(), 1))
+    else:
+        raise ValueError(f"Unknown kl_normalization: {kl_normalization}")
+
     # 2. KL Magnitude (Gamma or Gaussian)
     if magnitude_dist == "gamma":
-        kl_g = kl_gamma(params["k"], params["theta"], k_0, theta_0) / batch_size
+        kl_g_raw = kl_gamma(params["k"], params["theta"], k_0, theta_0)
     elif magnitude_dist == "gaussian":
-        kl_g = kl_gaussian(params["k"], params["theta"], prior_mu=0.0, prior_std=1.0) / batch_size
+        kl_g_raw = kl_gaussian(params["k"], params["theta"], prior_mu=0.0, prior_std=1.0)
     else:
         raise ValueError(f"Unknown magnitude_dist: {magnitude_dist}")
+    kl_g = kl_g_raw / kl_norm
 
     # 3. KL Categorical
-    kl_d = kl_categorical(params["logits"], prior_probs) / batch_size
+    kl_d_raw = kl_categorical(params["logits"], prior_probs)
+    kl_d = kl_d_raw / kl_norm
 
-    total = recon_loss + beta_gamma * kl_g + beta_delta * kl_d
+    weighted_kl_gamma = beta_gamma * kl_g
+    weighted_kl_delta = beta_delta * kl_d
+
+    total = recon_loss + weighted_kl_gamma + weighted_kl_delta
 
     return total, {
         "recon": recon_loss.detach(),
         "kl_gamma": kl_g.detach(),
         "kl_delta": kl_d.detach(),
+        "kl_gamma_raw": kl_g_raw.detach(),
+        "kl_delta_raw": kl_d_raw.detach(),
+        "kl_norm_factor": torch.tensor(kl_norm, device=x.device, dtype=x.dtype),
+        "weighted_kl_gamma": weighted_kl_gamma.detach(),
+        "weighted_kl_delta": weighted_kl_delta.detach(),
     }
 
+
+def compute_fully_polar_loss(
+    x: Tensor,
+    x_recon: Tensor,
+    params: dict[str, Tensor],
+    *,
+    k_0: float = 1.0,
+    theta_0: float = 1.0,
+    presence_prior_probs: Tensor | None = None,
+    sign_prior_probs: Tensor | None = None,
+    beta_gamma: float = 1.0,
+    beta_presence: float = 1.0,
+    beta_sign: float = 1.0,
+    masked_recon: bool = False,
+    lambda_silence: float = 0.1,
+    lambda_recon_l1: float = 0.0,
+    kl_normalization: str = "batch",
+    gamma_kl_target: str = "theta_tilde",
+    lambda_presence_consistency: float = 0.0,
+    presence_consistency_target: str = "argmax",
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """ELBO for the fully polar factorization with separate presence/sign KL terms."""
+    batch_size = x.size(0)
+
+    if masked_recon:
+        M = (x > 0).float()
+        err = (x_recon - x).pow(2)
+        signal_loss = (err * M).sum() / batch_size
+        silence_loss = (x_recon.pow(2) * (1.0 - M)).sum() / batch_size
+        recon_loss = signal_loss + lambda_silence * silence_loss
+    else:
+        recon_loss = F.mse_loss(x_recon, x, reduction="sum") / batch_size
+
+    if lambda_recon_l1 > 0.0:
+        recon_loss = recon_loss + lambda_recon_l1 * x_recon.abs().sum() / batch_size
+
+    if kl_normalization == "batch":
+        kl_norm = float(max(batch_size, 1))
+    elif kl_normalization == "site":
+        kl_norm = float(max(params["k"].numel(), 1))
+    else:
+        raise ValueError(f"Unknown kl_normalization: {kl_normalization}")
+
+    if gamma_kl_target == "theta_tilde":
+        theta_for_kl = params.get("theta_tilde", params["theta"])
+    elif gamma_kl_target in {"theta", "theta_final"}:
+        theta_for_kl = params.get("theta_final", params["theta"])
+    else:
+        raise ValueError(f"Unsupported gamma_kl_target: {gamma_kl_target}")
+    kl_g_raw = kl_gamma(params["k"], theta_for_kl, k_0, theta_0)
+    kl_g = kl_g_raw / kl_norm
+
+    kl_presence_raw = kl_categorical(params["presence_logits"], presence_prior_probs)
+    kl_presence = kl_presence_raw / kl_norm
+
+    kl_sign_raw = kl_categorical(params["sign_logits"], sign_prior_probs)
+    kl_sign = kl_sign_raw / kl_norm
+
+    presence_consistency_raw = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+    presence_consistency = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+    if lambda_presence_consistency > 0.0:
+        presence_probs = params["presence_probs"]
+        if presence_probs.dim() == 3 and presence_probs.shape[-1] == 1:
+            presence_probs = presence_probs.squeeze(-1)
+
+        if presence_consistency_target == "argmax":
+            presence_logits = params["presence_logits"]
+            if presence_logits.dim() == 4 and presence_logits.shape[-2] == 1:
+                presence_logits = presence_logits.squeeze(-2)
+            presence_target = (presence_logits.argmax(dim=-1) == 1).to(dtype=presence_probs.dtype).detach()
+        else:
+            raise ValueError(f"Unsupported presence_consistency_target: {presence_consistency_target}")
+
+        # Use an MSE penalty so the ST hard sample path still carries gradient.
+        presence_consistency_raw = (presence_probs - presence_target).pow(2).sum()
+        presence_consistency = presence_consistency_raw / kl_norm
+
+    weighted_kl_gamma = beta_gamma * kl_g
+    weighted_kl_presence = beta_presence * kl_presence
+    weighted_kl_sign = beta_sign * kl_sign
+    weighted_presence_consistency = lambda_presence_consistency * presence_consistency
+    weighted_kl_delta = weighted_kl_presence + weighted_kl_sign
+    kl_delta = kl_presence + kl_sign
+
+    total = recon_loss + weighted_kl_gamma + weighted_kl_presence + weighted_kl_sign + weighted_presence_consistency
+
+    return total, {
+        "recon": recon_loss.detach(),
+        "kl_gamma": kl_g.detach(),
+        "kl_delta": kl_delta.detach(),
+        "kl_presence": kl_presence.detach(),
+        "kl_sign": kl_sign.detach(),
+        "kl_gamma_raw": kl_g_raw.detach(),
+        "kl_delta_raw": (kl_presence_raw + kl_sign_raw).detach(),
+        "kl_presence_raw": kl_presence_raw.detach(),
+        "kl_sign_raw": kl_sign_raw.detach(),
+        "kl_norm_factor": torch.tensor(kl_norm, device=x.device, dtype=x.dtype),
+        "weighted_kl_gamma": weighted_kl_gamma.detach(),
+        "weighted_kl_delta": weighted_kl_delta.detach(),
+        "weighted_kl_presence": weighted_kl_presence.detach(),
+        "weighted_kl_sign": weighted_kl_sign.detach(),
+        "presence_consistency": presence_consistency.detach(),
+        "presence_consistency_raw": presence_consistency_raw.detach(),
+        "weighted_presence_consistency": weighted_presence_consistency.detach(),
+    }

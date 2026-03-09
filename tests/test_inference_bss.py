@@ -59,3 +59,36 @@ def test_separate_sources_smoke():
     assert out["source1_waveform"].shape[-1] >= wav.numel()
     assert out["source2_waveform"].shape[-1] >= wav.numel()
     assert len(np.unique(out["labels"])) == 2
+
+
+def test_separate_sources_restores_decoder_output_length():
+    model = HybridSparseVAE(
+        input_channels=65,
+        input_length=32,
+        encoder_type="resnet",
+        decoder_type="convnmf",
+        n_atoms=16,
+        latent_dim=8,
+        motif_width=8,
+        decoder_stride=4,
+    ).eval()
+
+    original_output_length = int(model.decoder.output_length)
+    wav = torch.randn(2048)
+    n_fft = 128
+    hop = 32
+    win = torch.hann_window(n_fft)
+    mix_c = torch.stft(wav, n_fft=n_fft, hop_length=hop, window=win, return_complex=True)
+    mix_mag = mix_c.abs().unsqueeze(0)
+
+    separate_sources(
+        model=model,
+        mix_mag=mix_mag,
+        mix_complex=mix_c.unsqueeze(0),
+        n_fft=n_fft,
+        hop_length=hop,
+        win_length=n_fft,
+        length=wav.numel(),
+    )
+
+    assert int(model.decoder.output_length) == original_output_length

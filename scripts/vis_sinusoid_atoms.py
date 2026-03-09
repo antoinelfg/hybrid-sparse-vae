@@ -51,6 +51,8 @@ def load_state_dict(path: Path, device: torch.device) -> dict[str, torch.Tensor]
         payload = torch.load(path, map_location=device)
     if isinstance(payload, dict) and "state_dict" in payload:
         state_dict = payload["state_dict"]
+    elif isinstance(payload, dict) and "model_state" in payload:
+        state_dict = payload["model_state"]
     elif isinstance(payload, dict):
         state_dict = payload
     else:
@@ -59,22 +61,35 @@ def load_state_dict(path: Path, device: torch.device) -> dict[str, torch.Tensor]
         state_dict = {k[len("model."):]: v for k, v in state_dict.items()}
     return state_dict
 
+
+def infer_arch_from_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    dict_w = state_dict.get("latent.dictionary.weight")
+    if torch.is_tensor(dict_w) and dict_w.dim() == 2:
+        out["latent_dim"] = int(dict_w.shape[0])
+        out["n_atoms"] = int(dict_w.shape[1])
+
+    dec_w = state_dict.get("decoder.net.0.weight")
+    if torch.is_tensor(dec_w) and dec_w.dim() == 2:
+        out["input_length"] = int(dec_w.shape[0])
+    return out
+
 def main():
     parser = argparse.ArgumentParser(description="Visualize Sinusoid Atoms")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     
-    parser.add_argument("--n-atoms", type=int, default=32)
-    parser.add_argument("--input-length", type=int, default=128)
-    parser.add_argument("--latent-dim", type=int, default=16)
-    parser.add_argument("--encoder-output-dim", type=int, default=256)
-    parser.add_argument("--encoder-type", type=str, default="linear")
-    parser.add_argument("--decoder-type", type=str, default="linear")
-    parser.add_argument("--dict-init", type=str, default="random")
-    parser.add_argument("--k-min", type=float, default=10.0)
-    parser.add_argument("--magnitude-dist", type=str, default="gamma")
-    parser.add_argument("--structure-mode", type=str, default="ternary")
+    parser.add_argument("--n-atoms", type=int, default=None)
+    parser.add_argument("--input-length", type=int, default=None)
+    parser.add_argument("--latent-dim", type=int, default=None)
+    parser.add_argument("--encoder-output-dim", type=int, default=None)
+    parser.add_argument("--encoder-type", type=str, default=None)
+    parser.add_argument("--decoder-type", type=str, default=None)
+    parser.add_argument("--dict-init", type=str, default=None)
+    parser.add_argument("--k-min", type=float, default=None)
+    parser.add_argument("--magnitude-dist", type=str, default=None)
+    parser.add_argument("--structure-mode", type=str, default=None)
 
     parser.add_argument("--atom-scale", type=float, default=None)
 
@@ -88,13 +103,17 @@ def main():
     hydra_cfg, hydra_cfg_path = load_hydra_config(ckpt_path)
     if hydra_cfg_path is not None:
         print(f"Using Hydra config defaults from: {hydra_cfg_path}")
+    state_dict = load_state_dict(ckpt_path, torch.device("cpu"))
+    inferred = infer_arch_from_state_dict(state_dict)
 
     def resolve_arg(arg_name: str, default: Any, hydra_key: str | None = None) -> Any:
         explicit = getattr(args, arg_name)
         if explicit is not None:
             return explicit
         key = hydra_key if hydra_key is not None else arg_name
-        return hydra_cfg.get(key, default)
+        if key in hydra_cfg:
+            return hydra_cfg[key]
+        return inferred.get(arg_name, default)
 
     args.n_atoms = int(resolve_arg("n_atoms", 32))
     args.input_length = int(resolve_arg("input_length", 128))
@@ -113,7 +132,7 @@ def main():
     
     print(f"Loading {ckpt_path}...")
     model = build_model(args)
-    model.load_state_dict(load_state_dict(ckpt_path, device))
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
 
@@ -131,11 +150,11 @@ def main():
         gamma = info.get("gamma", torch.ones_like(delta))
         
         if delta is not None:
-            activation_prob = delta.abs().mean(dim=0).cpu() 
+            activation_prob = delta.abs().mean(dim=0).squeeze(-1).cpu()
             active_mask = delta.abs() > 0.5
             mag_when_active = gamma.abs() * active_mask
-            sum_mag = mag_when_active.sum(dim=0)
-            count_active = active_mask.sum(dim=0)
+            sum_mag = mag_when_active.sum(dim=0).squeeze(-1)
+            count_active = active_mask.sum(dim=0).squeeze(-1)
             
             avg_mag = torch.zeros_like(sum_mag)
             avg_mag[count_active > 0] = sum_mag[count_active > 0] / count_active[count_active > 0].float()
@@ -187,44 +206,55 @@ def main():
                          'xtick.color': text_color, 'ytick.color': text_color,
                          'axes.facecolor': bg_color, 'figure.facecolor': bg_color})
 
-    # Plot atoms as 1D curves in a grid
-    n_cols = 4
-    n_rows = (args.n_atoms + n_cols - 1) // n_cols
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 2.5 * n_rows), sharey=True, sharex=True)
-    if args.n_atoms == 1:
-        axes = [axes]
-    else:
-        axes = axes.flatten()
-    
-    cmap = mpl.colormaps['plasma']
-    norm = plt.Normalize(vmin=0, vmax=float(activation_prob.max().clamp_min_(0.01)))
-    
-    for i in range(args.n_atoms):
-        ax = axes[i]
-        prob = float(activation_prob[i])
-        color = cmap(norm(prob))
-        
-        curve = atoms_recon[i].cpu().numpy()
-        ax.plot(curve, linewidth=2, color='white')
-        
-        # Draw a colored border
-        ax.set_facecolor(mcolors.to_rgba(color, alpha=0.3))
-        ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
-        for spine in ax.spines.values():
-            spine.set_edgecolor(color)
-            spine.set_linewidth(2)
-            
-        ax.text(0.05, 0.85, f"P={prob:.2f}", transform=ax.transAxes, color='white', 
-                fontsize=10, bbox=dict(facecolor='black', alpha=0.5, edgecolor='none'))
+    def plot_curve_grid(curves: torch.Tensor, title: str, filename: str) -> None:
+        n_cols = 4
+        n_rows = (args.n_atoms + n_cols - 1) // n_cols
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 2.5 * n_rows), sharey=True, sharex=True)
+        if args.n_atoms == 1:
+            axes = [axes]
+        else:
+            axes = axes.flatten()
 
-    plt.suptitle(f"Hybrid Sparse VAE: Learned 1D Atoms ({args.n_atoms} atoms)", fontsize=20, weight='bold', color=text_color)
-    plt.tight_layout()
-    plt.subplots_adjust(top=0.92)  # leave room for suptitle
-    plt.savefig(out_path / "atoms_1d_curves.png", bbox_inches='tight', dpi=150)
-    plt.close()
+        cmap = mpl.colormaps['plasma']
+        norm = plt.Normalize(vmin=0, vmax=float(activation_prob.max().clamp_min_(0.01)))
+
+        for i in range(args.n_atoms):
+            ax = axes[i]
+            prob = float(activation_prob[i])
+            color = cmap(norm(prob))
+
+            curve = curves[i].cpu().numpy()
+            ax.plot(curve, linewidth=2, color='white')
+
+            ax.set_facecolor(mcolors.to_rgba(color, alpha=0.3))
+            ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+            for spine in ax.spines.values():
+                spine.set_edgecolor(color)
+                spine.set_linewidth(2)
+
+            ax.text(0.05, 0.85, f"P={prob:.2f}", transform=ax.transAxes, color='white',
+                    fontsize=10, bbox=dict(facecolor='black', alpha=0.5, edgecolor='none'))
+
+        plt.suptitle(title, fontsize=20, weight='bold', color=text_color)
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.92)
+        plt.savefig(out_path / filename, bbox_inches='tight', dpi=150)
+        plt.close()
+
+    plot_curve_grid(
+        atoms_recon,
+        f"Hybrid Sparse VAE: Learned 1D Atoms ({args.n_atoms} atoms)",
+        "atoms_1d_curves.png",
+    )
+    plot_curve_grid(
+        atoms_diff,
+        f"Hybrid Sparse VAE: 1D Atom Strokes ({args.n_atoms} atoms)",
+        "atoms_strokes_1d_curves.png",
+    )
     
     plt.rcParams.update(plt.rcParamsDefault)
     print(f"✓ Saved 1D curves to {out_path / 'atoms_1d_curves.png'}")
+    print(f"✓ Saved 1D strokes to {out_path / 'atoms_strokes_1d_curves.png'}")
 
     print("Generating reconstructions...")
     plt.rcParams.update({'text.color': text_color, 'axes.labelcolor': text_color,
